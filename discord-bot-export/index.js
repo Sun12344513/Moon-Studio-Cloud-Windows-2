@@ -124,9 +124,104 @@ export function createStatusEmbed({ title, description, color = COLORS.PRIMARY, 
   return embed;
 }
 
+export function formatTimestampHoChiMinh(isoTimestamp) {
+  const parsed = isoTimestamp ? new Date(isoTimestamp) : new Date();
+  const safeDate = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+
+  const parts = {};
+  for (const part of formatter.formatToParts(safeDate)) {
+    if (part.type !== 'literal') {
+      parts[part.type] = part.value;
+    }
+  }
+
+  return `${parts.weekday}, ${parts.month} ${parts.day}, ${parts.year} - ${parts.hour}:${parts.minute}:${parts.second} (Asia/Ho_Chi_Minh)`;
+}
+
+export function resolveDiscordUserDisplay(interaction) {
+  const userId = interaction.user?.id || 'unknown';
+  const username = interaction.user?.username || `user_${userId.slice(-4)}`;
+  const displayName =
+    interaction.member?.displayName ||
+    interaction.user?.globalName ||
+    interaction.user?.displayName ||
+    username;
+  return {
+    userId,
+    username,
+    displayName,
+    mention: `<@${userId}>`,
+  };
+}
+
+export function buildPublicVpsAnnouncementEmbed({ interaction, osName }) {
+  const { displayName, username, mention } = resolveDiscordUserDisplay(interaction);
+  return createStatusEmbed({
+    title: 'Moon Studio Cloud — VPS Provisioned',
+    description: `User **${displayName}** (@${username} • ${mention}) successfully received one **${osName}** virtual machine.`,
+    color: COLORS.SUCCESS,
+    fields: [
+      { name: 'User', value: `${displayName} (${mention})`, inline: true },
+      { name: 'Username', value: `\`@${username}\``, inline: true },
+      { name: 'Operating System', value: `**${osName}**`, inline: true },
+    ],
+    footerText: 'Moon Studio Cloud Infrastructure • Public Provisioning Announcement',
+  });
+}
+
+export function buildPrivateCredentialsEmbed(credentials) {
+  const osName = credentials.os_name || (credentials.os_id === 'windows-7' ? 'Windows 7' : 'Debian 12');
+  const createdAtFormatted = formatTimestampHoChiMinh(credentials.created_at);
+  const ipDisplay = credentials.public_endpoint || credentials.public_ip || 'Unavailable';
+
+  return createStatusEmbed({
+    title: 'Your Moon Studio VPS Credentials',
+    description: `Your **${osName}** virtual machine is ready. This Ephemeral message is visible only to you—save your credentials securely now.`,
+    color: COLORS.PRIMARY,
+    fields: [
+      { name: 'Operating System', value: String(osName), inline: true },
+      { name: 'VPS ID', value: `\`${credentials.vps_id}\``, inline: true },
+      { name: 'Public IP Address', value: `\`${credentials.public_ip || 'N/A'}\``, inline: true },
+      { name: 'Connection Endpoint', value: `\`${ipDisplay}\``, inline: false },
+      { name: 'Username', value: `\`${credentials.username}\``, inline: true },
+      { name: 'Password', value: `\`${credentials.password}\``, inline: true },
+      { name: 'Created At', value: createdAtFormatted, inline: false },
+    ],
+    footerText: 'Moon Studio Cloud Security • Private Ephemeral Credential Delivery',
+  });
+}
+
+export async function safeDeferEphemeral(interaction) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      return { ok: true, alreadyAcknowledged: true };
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    return { ok: true, alreadyAcknowledged: false };
+  } catch (err) {
+    const code = err?.code;
+    const msg = String(err?.message || err);
+    const expired = code === 10062 || code === 40060 || /unknown interaction|already been acknowledged/i.test(msg);
+    console.error('[DiscordBot] Failed to defer ephemeral reply:', sanitizeErrorMessage(msg));
+    return { ok: false, expired, error: msg };
+  }
+}
+
 /**
  * Enforces the mandatory Discord Embed-Only Policy.
- * Never sets `content`; every response, error, loading state, or ephemeral notice uses `embeds`.
+ * Checks interaction state carefully to avoid InteractionAlreadyReplied and Unknown Interaction errors.
  */
 export async function sendEmbedResponse(interaction, embed, { ephemeral = false } = {}) {
   const payload = { embeds: [embed] };
@@ -145,8 +240,28 @@ export async function sendEmbedResponse(interaction, embed, { ephemeral = false 
       ...(ephemeral ? { flags: MessageFlags.Ephemeral } : {}),
     });
   } catch (err) {
-    console.error('[DiscordBot] Failed to deliver embed response:', err?.message || err);
+    console.error('[DiscordBot] Failed to deliver embed response:', sanitizeErrorMessage(err?.message || err));
     return null;
+  }
+}
+
+export async function deliverEphemeralCredentials(interaction, credentialsEmbed, secrets = []) {
+  const payload = { embeds: [credentialsEmbed] };
+  try {
+    if (interaction.deferred) {
+      await interaction.editReply(payload);
+      return { ok: true };
+    }
+    if (interaction.replied) {
+      await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
+      return { ok: true };
+    }
+    await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
+    return { ok: true };
+  } catch (err) {
+    const safeMsg = sanitizeErrorMessage(err?.message || err, secrets);
+    console.error('[DiscordBot] Ephemeral credential delivery failed:', safeMsg);
+    return { ok: false, error: safeMsg };
   }
 }
 
@@ -334,7 +449,12 @@ export function isAuthorizedTestModeAdmin(interaction) {
   return interaction.user?.id === AUTHORIZED_ADMIN_ID;
 }
 
-export function buildCommands({ apiClient, configuredAdmins = parseAdminIdSet() }) {
+export function buildCommands({
+  apiClient,
+  configuredAdmins = parseAdminIdSet(),
+  pollIntervalMs = 500,
+  maxProvisionWaitMs = 120_000,
+}) {
   const commands = new Map();
 
   // 1. /help
@@ -353,6 +473,7 @@ export function buildCommands({ apiClient, configuredAdmins = parseAdminIdSet() 
             name: 'VPS Management',
             value: [
               '`/create-vps` — Provision a new Cloud VPS (`debian-12` or `windows-7`)',
+              '`/get-vps-credentials` — Private Ephemeral recovery of undelivered VPS credentials',
               '`/list-vps` — List your active VPS instances',
               '`/vps-info` — Inspect live status & endpoint for a VPS',
               '`/vps-power` — Start, stop, restart, rebuild, or reload IP on a VPS',
@@ -382,7 +503,7 @@ export function buildCommands({ apiClient, configuredAdmins = parseAdminIdSet() 
           {
             name: 'Security & Cooldown Policy',
             value:
-              '• **POST Cooldown**: Fixed `600 seconds (10 minutes)` per Discord User ID.\n• **Credentials**: Managed server-side by system policy and never displayed in Embeds or logs.',
+              '• **POST Cooldown**: Fixed `600 seconds (10 minutes)` per Discord User ID.\n• **Credentials**: Delivered strictly via private Ephemeral Embed (`Your Moon Studio VPS Credentials`) to the VPS creator only—never via public channel or DM.',
           },
         ],
       });
@@ -500,7 +621,10 @@ export function buildCommands({ apiClient, configuredAdmins = parseAdminIdSet() 
         return sendEmbedResponse(interaction, errEmbed, { ephemeral: true });
       }
 
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const deferRes = await safeDeferEphemeral(interaction);
+      if (!deferRes.ok && deferRes.expired) {
+        return null;
+      }
 
       const res = await apiClient.request({
         method: 'POST',
@@ -514,6 +638,7 @@ export function buildCommands({ apiClient, configuredAdmins = parseAdminIdSet() 
           ...(memoryMb ? { memory_mb: memoryMb } : {}),
           ...(diskGb ? { disk_gb: diskGb } : {}),
           ...(machineId ? { machine_id: machineId } : {}),
+          ...(interaction.id ? { idempotency_key: String(interaction.id) } : {}),
         },
       });
 
@@ -523,33 +648,213 @@ export function buildCommands({ apiClient, configuredAdmins = parseAdminIdSet() 
         });
       }
 
-      const vps = res.data?.vps || {};
-      const machine = res.data?.machine || {};
-      const embed = createStatusEmbed({
-        title: 'Cloud VPS Provisioned Successfully',
-        description: `Your new **${vps.os_name || osId}** instance has been queued and initialized.`,
-        color: COLORS.SUCCESS,
-        fields: [
-          { name: 'VPS ID', value: `\`${vps.vps_id || 'N/A'}\``, inline: true },
-          { name: 'Machine ID', value: `\`${machine.machine_id || vps.machine_id || 'N/A'}\``, inline: true },
-          { name: 'Status', value: `\`${vps.status || 'Queued'}\``, inline: true },
-          { name: 'Operating System', value: String(vps.os_name || osId), inline: true },
-          {
-            name: 'Resources',
-            value: `${vps.cores || 2} vCPU • ${vps.memory_mb || 2048} MB RAM • ${vps.disk_gb || 40} GB Disk`,
-            inline: true,
-          },
-          { name: 'Username', value: `\`${vps.username || 'Administrator'}\``, inline: true },
-          { name: 'Endpoint', value: `\`${vps.public_endpoint || 'Provisioning...'}\``, inline: false },
-          {
-            name: 'Security Notice',
-            value:
-              'System default credential policy applied securely on the server. Passwords are never transmitted or displayed in Discord.',
-            inline: false,
-          },
-        ],
+      let latestVps = res.data?.vps || {};
+      const vpsId = latestVps.vps_id;
+      if (!vpsId) {
+        const missingEmbed = createStatusEmbed({
+          title: 'VPS Provisioning Error',
+          description: 'Management API did not return a valid VPS ID.',
+          color: COLORS.ERROR,
+        });
+        return sendEmbedResponse(interaction, missingEmbed, { ephemeral: true });
+      }
+
+      // Poll until provisioning & guest credential configuration finish (or fail/timeout)
+      const deadline = Date.now() + maxProvisionWaitMs;
+      while (
+        !(latestVps.status === 'Ready' && latestVps.credentials_ready) &&
+        latestVps.status !== 'Failed' &&
+        Date.now() < deadline
+      ) {
+        await new Promise((r) => setTimeout(r, pollIntervalMs));
+        const statusRes = await apiClient.request({
+          method: 'GET',
+          path: `/api/v1/vps/${encodeURIComponent(vpsId)}`,
+          discordUserId: interaction.user.id,
+          discordUsername: interaction.user.username,
+        });
+        if (statusRes.ok && statusRes.data?.vps) {
+          latestVps = statusRes.data.vps;
+        }
+      }
+
+      if (latestVps.status === 'Failed') {
+        const failEmbed = createStatusEmbed({
+          title: 'VPS Provisioning Failed',
+          description: sanitizeErrorMessage(
+            latestVps.failure_reason || latestVps.status_message || 'Guest provisioning or credential setup failed.',
+            [apiClient.botSecret]
+          ),
+          color: COLORS.ERROR,
+          fields: [
+            { name: 'VPS ID', value: `\`${vpsId}\``, inline: true },
+            { name: 'Status', value: '`Failed`', inline: true },
+          ],
+        });
+        return sendEmbedResponse(interaction, failEmbed, { ephemeral: true });
+      }
+
+      if (latestVps.status !== 'Ready' || !latestVps.credentials_ready) {
+        const pendingEmbed = createStatusEmbed({
+          title: 'VPS Provisioning In Progress',
+          description: `VPS \`${vpsId}\` is still initializing (${latestVps.status || 'Booting'}). Credentials will become available privately once guest configuration finishes.`,
+          color: COLORS.WARNING,
+          fields: [
+            { name: 'VPS ID', value: `\`${vpsId}\``, inline: true },
+            { name: 'Current Status', value: `\`${latestVps.status || 'Queued'}\``, inline: true },
+            {
+              name: 'Private Recovery',
+              value: `Once \`/vps-info vps_id:${vpsId}\` shows Ready, run \`/get-vps-credentials vps_id:${vpsId}\` to view credentials privately.`,
+              inline: false,
+            },
+          ],
+        });
+        return sendEmbedResponse(interaction, pendingEmbed, { ephemeral: true });
+      }
+
+      // Retrieve actual guest credentials via authenticated one-time API operation
+      const credRes = await apiClient.request({
+        method: 'POST',
+        path: `/api/v1/vps/${encodeURIComponent(vpsId)}/credentials`,
+        discordUserId: interaction.user.id,
+        discordUsername: interaction.user.username,
+        body: { mode: 'initial' },
       });
-      return sendEmbedResponse(interaction, embed, { ephemeral: true });
+
+      if (!credRes.ok || !credRes.data?.credentials) {
+        await apiClient.request({
+          method: 'POST',
+          path: `/api/v1/vps/${encodeURIComponent(vpsId)}/delivery-status`,
+          discordUserId: interaction.user.id,
+          discordUsername: interaction.user.username,
+          body: { ephemeral_failed: true },
+        }).catch(() => null);
+
+        const credErrEmbed = buildApiErrorEmbed(credRes, 'Credential Retrieval');
+        return sendEmbedResponse(interaction, credErrEmbed, { ephemeral: true });
+      }
+
+      const credentials = credRes.data.credentials;
+      const osDisplayName =
+        credentials.os_name || latestVps.os_name || (osId === 'windows-7' ? 'Windows 7' : 'Debian 12');
+
+      // FLOW 1: Public Success Announcement in current channel (NO credentials, NO IP, NO password)
+      if (!latestVps.public_announcement_sent && typeof interaction.channel?.send === 'function') {
+        try {
+          const publicEmbed = buildPublicVpsAnnouncementEmbed({
+            interaction,
+            osName: osDisplayName,
+          });
+          await interaction.channel.send({ embeds: [publicEmbed] });
+          await apiClient.request({
+            method: 'POST',
+            path: `/api/v1/vps/${encodeURIComponent(vpsId)}/delivery-status`,
+            discordUserId: interaction.user.id,
+            discordUsername: interaction.user.username,
+            body: { public_announcement_sent: true },
+          }).catch(() => null);
+        } catch (announceErr) {
+          console.warn(
+            '[DiscordBot] Public announcement delivery failed (provisioning unaffected):',
+            sanitizeErrorMessage(announceErr?.message || announceErr, [apiClient.botSecret, credentials.password])
+          );
+        }
+      }
+
+      // FLOW 2: Private Ephemeral Credentials Delivery via the /create-vps interaction only
+      const credentialsEmbed = buildPrivateCredentialsEmbed(credentials);
+      const delivery = await deliverEphemeralCredentials(interaction, credentialsEmbed, [
+        apiClient.botSecret,
+        credentials.password,
+      ]);
+
+      if (delivery.ok) {
+        await apiClient.request({
+          method: 'POST',
+          path: `/api/v1/vps/${encodeURIComponent(vpsId)}/delivery-status`,
+          discordUserId: interaction.user.id,
+          discordUsername: interaction.user.username,
+          body: { ephemeral_delivered: true },
+        }).catch(() => null);
+      } else {
+        // NEVER fallback to channel.send, DM, #5uw, or another channel; enable single Ephemeral recovery
+        await apiClient.request({
+          method: 'POST',
+          path: `/api/v1/vps/${encodeURIComponent(vpsId)}/delivery-status`,
+          discordUserId: interaction.user.id,
+          discordUsername: interaction.user.username,
+          body: { ephemeral_failed: true },
+        }).catch(() => null);
+      }
+
+      return null;
+    },
+  });
+
+  // 3b. /get-vps-credentials (Private Ephemeral fallback if initial interaction expired or failed)
+  commands.set('get-vps-credentials', {
+    data: new SlashCommandBuilder()
+      .setName('get-vps-credentials')
+      .setDescription('Privately retrieve undelivered credentials for one of your Ready VPS instances')
+      .addStringOption((opt) =>
+        opt.setName('vps_id').setDescription('The ID of your provisioned VPS').setRequired(true)
+      ),
+    async execute(interaction) {
+      const vpsId = interaction.options.getString('vps_id', true).trim();
+      if (!vpsId || vpsId.length < 3 || vpsId.length > 80) {
+        const errEmbed = createStatusEmbed({
+          title: 'Invalid VPS ID',
+          description: 'Please provide a valid `vps_id` (3-80 characters).',
+          color: COLORS.ERROR,
+        });
+        return sendEmbedResponse(interaction, errEmbed, { ephemeral: true });
+      }
+
+      const deferRes = await safeDeferEphemeral(interaction);
+      if (!deferRes.ok && deferRes.expired) {
+        return null;
+      }
+
+      const res = await apiClient.request({
+        method: 'POST',
+        path: `/api/v1/vps/${encodeURIComponent(vpsId)}/credentials`,
+        discordUserId: interaction.user.id,
+        discordUsername: interaction.user.username,
+        body: { mode: 'recovery' },
+      });
+
+      if (!res.ok || !res.data?.credentials) {
+        return sendEmbedResponse(interaction, buildApiErrorEmbed(res, 'Private Credential Recovery'), {
+          ephemeral: true,
+        });
+      }
+
+      const credentials = res.data.credentials;
+      const credentialsEmbed = buildPrivateCredentialsEmbed(credentials);
+      const delivery = await deliverEphemeralCredentials(interaction, credentialsEmbed, [
+        apiClient.botSecret,
+        credentials.password,
+      ]);
+
+      if (delivery.ok) {
+        await apiClient.request({
+          method: 'POST',
+          path: `/api/v1/vps/${encodeURIComponent(vpsId)}/delivery-status`,
+          discordUserId: interaction.user.id,
+          discordUsername: interaction.user.username,
+          body: { ephemeral_delivered: true },
+        }).catch(() => null);
+      } else {
+        await apiClient.request({
+          method: 'POST',
+          path: `/api/v1/vps/${encodeURIComponent(vpsId)}/delivery-status`,
+          discordUserId: interaction.user.id,
+          discordUsername: interaction.user.username,
+          body: { ephemeral_failed: true },
+        }).catch(() => null);
+      }
+
+      return null;
     },
   });
 
@@ -1469,7 +1774,14 @@ export async function registerSlashCommands({ token, clientId, guildId, commands
   }
 }
 
-export function createBotContext({ apiBaseUrl, botSecret, adminIds, fetchImpl } = {}) {
+export function createBotContext({
+  apiBaseUrl,
+  botSecret,
+  adminIds,
+  fetchImpl,
+  pollIntervalMs,
+  maxProvisionWaitMs,
+} = {}) {
   const apiClient = new ManagementApiClient({
     baseUrl: apiBaseUrl || process.env.API_BASE_URL || 'http://127.0.0.1:3000',
     botSecret: botSecret || resolveBotSecret(),
@@ -1477,7 +1789,12 @@ export function createBotContext({ apiBaseUrl, botSecret, adminIds, fetchImpl } 
   });
 
   const configuredAdmins = adminIds instanceof Set ? adminIds : parseAdminIdSet();
-  const commands = buildCommands({ apiClient, configuredAdmins });
+  const commands = buildCommands({
+    apiClient,
+    configuredAdmins,
+    ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
+    ...(maxProvisionWaitMs !== undefined ? { maxProvisionWaitMs } : {}),
+  });
   const handleInteraction = createInteractionHandler({ commands });
 
   return {

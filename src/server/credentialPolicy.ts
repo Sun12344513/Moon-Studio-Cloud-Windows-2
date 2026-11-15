@@ -86,3 +86,184 @@ export function sanitizePublicRecord<T extends object>(record: T): Omit<T, 'pass
   }
   return copy as Omit<T, 'password' | 'passwordHash' | 'password_hash'>;
 }
+
+export interface ProvisionedCredentialPayload {
+  vps_id: string;
+  os_id: 'debian-12' | 'windows-7';
+  os_name: string;
+  public_ip: string;
+  public_endpoint: string;
+  username: string;
+  password: string;
+  created_at: string;
+}
+
+interface EncryptedVaultEntry {
+  vpsId: string;
+  ownerDiscordUserId: string;
+  iv: string;
+  authTag: string;
+  ciphertext: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+  delivered: boolean;
+  deliveredAt: string | null;
+  deliveryCount: number;
+  recoveryAllowed: boolean;
+}
+
+export class CredentialVaultError extends Error {
+  public readonly statusCode: number;
+  public readonly code: string;
+
+  constructor(statusCode: number, code: string, message: string) {
+    super(message);
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
+export const DEFAULT_CREDENTIAL_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * In-memory AES-256-GCM encrypted vault for short-lived, controlled VPS credential delivery.
+ * Plaintext passwords are never persisted to disk and are purged immediately once Ephemeral delivery succeeds.
+ */
+export class CredentialVault {
+  private readonly encryptionKey: Buffer;
+  private entries: Map<string, EncryptedVaultEntry> = new Map();
+  private nowProvider: () => number;
+
+  constructor(options?: { nowProvider?: () => number; masterKey?: Buffer }) {
+    this.encryptionKey = options?.masterKey || crypto.randomBytes(32);
+    this.nowProvider = options?.nowProvider || (() => Date.now());
+  }
+
+  public store(
+    ownerDiscordUserId: string,
+    payload: ProvisionedCredentialPayload,
+    ttlMs = DEFAULT_CREDENTIAL_TTL_MS
+  ): void {
+    serverLogger.registerSecret(payload.password);
+
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', this.encryptionKey, iv);
+    const plaintext = JSON.stringify(payload);
+    const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    const nowMs = this.nowProvider();
+
+    this.entries.set(payload.vps_id, {
+      vpsId: payload.vps_id,
+      ownerDiscordUserId,
+      iv: iv.toString('hex'),
+      authTag: authTag.toString('hex'),
+      ciphertext: encrypted.toString('hex'),
+      createdAtMs: nowMs,
+      expiresAtMs: nowMs + ttlMs,
+      delivered: false,
+      deliveredAt: null,
+      deliveryCount: 0,
+      recoveryAllowed: false,
+    });
+  }
+
+  public hasActiveEntry(vpsId: string): boolean {
+    const entry = this.entries.get(vpsId);
+    if (!entry) return false;
+    if (this.nowProvider() > entry.expiresAtMs) {
+      this.entries.delete(vpsId);
+      return false;
+    }
+    return true;
+  }
+
+  public markRecoveryAllowed(vpsId: string): void {
+    const entry = this.entries.get(vpsId);
+    if (entry) {
+      entry.recoveryAllowed = true;
+    }
+  }
+
+  public purge(vpsId: string): boolean {
+    return this.entries.delete(vpsId);
+  }
+
+  public retrieve(params: {
+    vpsId: string;
+    actorDiscordUserId: string;
+    isAuthorizedAdmin: boolean;
+    mode?: 'initial' | 'recovery';
+  }): ProvisionedCredentialPayload {
+    const entry = this.entries.get(params.vpsId);
+    if (!entry) {
+      throw new CredentialVaultError(
+        404,
+        'CREDENTIALS_UNAVAILABLE',
+        'VPS credentials have already been delivered and purged or are not available for this instance.'
+      );
+    }
+
+    if (this.nowProvider() > entry.expiresAtMs) {
+      this.entries.delete(params.vpsId);
+      throw new CredentialVaultError(
+        410,
+        'CREDENTIALS_EXPIRED',
+        'The temporary secure credential retrieval window has expired.'
+      );
+    }
+
+    const isOwner = entry.ownerDiscordUserId === params.actorDiscordUserId;
+    if (!isOwner && !params.isAuthorizedAdmin) {
+      throw new CredentialVaultError(
+        403,
+        'FORBIDDEN',
+        'You are not authorized to access credentials for this VPS.'
+      );
+    }
+
+    const mode = params.mode === 'recovery' ? 'recovery' : 'initial';
+
+    if (mode === 'initial' && entry.delivered) {
+      throw new CredentialVaultError(
+        409,
+        'CREDENTIAL_ALREADY_DELIVERED',
+        'Initial credentials for this VPS have already been retrieved.'
+      );
+    }
+
+    if (mode === 'recovery' && entry.delivered && !entry.recoveryAllowed) {
+      throw new CredentialVaultError(
+        409,
+        'CREDENTIAL_ALREADY_DELIVERED',
+        'VPS credentials were already delivered privately and cannot be re-issued.'
+      );
+    }
+
+    const decipher = crypto.createDecipheriv(
+      'aes-256-gcm',
+      this.encryptionKey,
+      Buffer.from(entry.iv, 'hex')
+    );
+    decipher.setAuthTag(Buffer.from(entry.authTag, 'hex'));
+    const decrypted = Buffer.concat([
+      decipher.update(Buffer.from(entry.ciphertext, 'hex')),
+      decipher.final(),
+    ]).toString('utf8');
+
+    const payload = JSON.parse(decrypted) as ProvisionedCredentialPayload;
+    entry.delivered = true;
+    entry.deliveredAt = new Date(this.nowProvider()).toISOString();
+    entry.deliveryCount += 1;
+
+    if (mode === 'recovery') {
+      // One-time recovery retrieval: consume and purge immediately
+      this.entries.delete(params.vpsId);
+    }
+
+    return payload;
+  }
+}
+
+export const credentialVault = new CredentialVault();
+

@@ -5,6 +5,7 @@ import {
   POST_COOLDOWN_SECONDS,
   MachineStatus,
   DiscordUserRole,
+  VpsRecord,
 } from './registryStore';
 import {
   AUTHORIZED_ADMIN_ID,
@@ -12,7 +13,13 @@ import {
   getBotApiSecret,
   isValidDiscordUserId,
 } from './botAuth';
-import { sanitizePublicRecord } from './credentialPolicy';
+import {
+  CredentialVault,
+  CredentialVaultError,
+  credentialVault,
+  hashPasswordScrypt,
+  sanitizePublicRecord,
+} from './credentialPolicy';
 import { serverLogger } from './logger';
 import { SupportedOsId } from './imageManager';
 import { VmRecord } from './vmManager';
@@ -27,6 +34,9 @@ export interface VmLifecycleAdapter {
     diskGb?: number;
     username?: string;
     useDefaultCredentialPolicy?: boolean;
+    generateUniqueCredentials?: boolean;
+    onProvisioned?: (vm: VmRecord, actualPassword: string) => void;
+    onProvisionFailed?: (vm: VmRecord, reason: string) => void;
   }): Promise<VmRecord>;
   getVm(id: string): VmRecord | undefined;
   startVm(vmId: string): Promise<boolean>;
@@ -47,6 +57,14 @@ export interface VmLifecycleAdapter {
 }
 
 function handleRegistryOrServerError(res: Response, err: unknown, context: string): Response {
+  if (err instanceof CredentialVaultError) {
+    return res.status(err.statusCode).json({
+      success: false,
+      code: err.code,
+      error: err.message,
+    });
+  }
+
   if (err instanceof RegistryError) {
     const body: Record<string, unknown> = {
       success: false,
@@ -70,22 +88,14 @@ function handleRegistryOrServerError(res: Response, err: unknown, context: strin
 }
 
 function formatVpsResponse(
-  vps: {
-    vps_id: string;
-    machine_id: string;
-    discord_user_id: string;
-    os_id: SupportedOsId;
-    name: string;
-    cores: number;
-    memory_mb: number;
-    disk_gb: number;
-    status: string;
-    created_at: string;
-    updated_at: string;
-  },
+  vps: Omit<VpsRecord, 'password_hash'>,
   liveVm?: VmRecord
 ) {
   const cleanVps = sanitizePublicRecord(vps as unknown as Record<string, unknown>);
+  const credentialsReady = Boolean(vps.credentials_ready ?? liveVm?.credentialsConfigured);
+  const completedAt = vps.completed_at || liveVm?.provisioningCompletedAt || null;
+  const failureReason = vps.failure_reason || liveVm?.failureReason || null;
+
   return {
     ...cleanVps,
     os_name: liveVm?.osName || (vps.os_id === 'windows-7' ? 'Windows 7' : 'Debian 12'),
@@ -95,16 +105,23 @@ function formatVpsResponse(
     port: liveVm?.localPort || null,
     public_endpoint: liveVm?.publicEndpoint || null,
     username: liveVm?.username || 'Administrator',
-    credential_policy: 'default_managed',
+    credentials_ready: credentialsReady,
+    completed_at: completedAt,
+    failure_reason: failureReason,
+    public_announcement_sent: Boolean(vps.public_announcement_sent),
+    ephemeral_delivered: Boolean(vps.ephemeral_delivered),
+    ephemeral_failed: Boolean(vps.ephemeral_failed),
   };
 }
 
 export function createManagementRouter(deps: {
   store: RegistryStore;
   vmAdapter: VmLifecycleAdapter;
+  vault?: CredentialVault;
   getSecret?: () => string;
 }): Router {
   const { store, vmAdapter } = deps;
+  const vault = deps.vault || credentialVault;
   const router = Router();
 
   // CORS & Preflight handling
@@ -407,7 +424,12 @@ export function createManagementRouter(deps: {
     }
 
     try {
-      const { vps, machine } = await store.createVpsSubmission({
+      const idempotencyKey =
+        typeof body.idempotency_key === 'string' && body.idempotency_key.trim()
+          ? body.idempotency_key.trim().slice(0, 128)
+          : undefined;
+
+      const { vps, machine, idempotentReplay } = await store.createVpsSubmission({
         discordUserId: auth.discordUserId,
         discordUsername: auth.discordUsername,
         osId,
@@ -416,6 +438,7 @@ export function createManagementRouter(deps: {
         memoryMb,
         diskGb,
         machineId: typeof body.machine_id === 'string' ? body.machine_id : undefined,
+        idempotencyKey,
         provisionVm: async (args) => {
           const vm = await vmAdapter.createVm({
             osId: args.osId,
@@ -423,15 +446,64 @@ export function createManagementRouter(deps: {
             cores: args.cores,
             memoryMb: args.memoryMb,
             diskGb: args.diskGb,
-            useDefaultCredentialPolicy: true,
+            generateUniqueCredentials: true,
+            onProvisioned: (completedVm, actualPassword) => {
+              const completedAt =
+                completedVm.provisioningCompletedAt ||
+                completedVm.credentialsConfiguredAt ||
+                new Date().toISOString();
+
+              vault.store(auth.discordUserId, {
+                vps_id: completedVm.id,
+                os_id: completedVm.osId,
+                os_name: completedVm.osName,
+                public_ip: completedVm.ipAddress,
+                public_endpoint: completedVm.publicEndpoint,
+                username: completedVm.username,
+                password: actualPassword,
+                created_at: completedAt,
+              });
+
+              store
+                .markVpsProvisioningState(completedVm.id, {
+                  status: completedVm.status,
+                  credentialsReady: true,
+                  completedAt,
+                  failureReason: null,
+                  passwordHash: hashPasswordScrypt(actualPassword),
+                })
+                .catch((e) => {
+                  serverLogger.error('ManagementAPI', `Failed to sync ready state for ${completedVm.id}: ${e}`);
+                });
+            },
+            onProvisionFailed: (failedVm, reason) => {
+              vault.purge(failedVm.id);
+              store
+                .markVpsProvisioningState(failedVm.id, {
+                  status: 'Failed',
+                  credentialsReady: false,
+                  failureReason: reason,
+                })
+                .catch((e) => {
+                  serverLogger.error('ManagementAPI', `Failed to sync failed state for ${failedVm.id}: ${e}`);
+                });
+            },
           });
-          return { vmId: vm.id, status: vm.status };
+
+          const isReadyNow = vm.status === 'Ready' && Boolean(vm.credentialsConfigured);
+          return {
+            vmId: vm.id,
+            status: vm.status,
+            credentialsReady: isReadyNow,
+            completedAt: isReadyNow ? vm.provisioningCompletedAt || vm.updatedAt : null,
+          };
         },
       });
 
       const liveVm = vmAdapter.getVm(vps.vps_id);
-      return res.status(201).json({
+      return res.status(idempotentReplay ? 200 : 201).json({
         success: true,
+        idempotent_replay: idempotentReplay,
         vps: formatVpsResponse(vps, liveVm),
         machine,
         cooldown_seconds: POST_COOLDOWN_SECONDS,
@@ -465,6 +537,136 @@ export function createManagementRouter(deps: {
       success: true,
       vps: formatVpsResponse(vps, vmAdapter.getVm(vps.vps_id)),
     });
+  });
+
+  // Private Authenticated Credential Retrieval (Owner or Authorized Admin 1390253651574132828 only)
+  router.post('/vps/:vpsId/credentials', authMiddleware, ensureAuthenticatedUser, async (req: Request, res: Response) => {
+    const auth = req.discordAuth!;
+    const vpsId = req.params.vpsId;
+    const vps = store.getVps(vpsId);
+
+    if (!vps) {
+      return res.status(404).json({
+        success: false,
+        code: 'VPS_NOT_FOUND',
+        error: `VPS '${vpsId}' not found.`,
+      });
+    }
+
+    const isOwner = vps.discord_user_id === auth.discordUserId;
+    const isAuthorizedAdmin = auth.discordUserId === AUTHORIZED_ADMIN_ID;
+    if (!isOwner && !isAuthorizedAdmin) {
+      return res.status(403).json({
+        success: false,
+        code: 'FORBIDDEN',
+        error: 'You are not authorized to access credentials for another user\'s VPS.',
+      });
+    }
+
+    const liveVm = vmAdapter.getVm(vpsId);
+    const effectiveStatus = liveVm?.status || vps.status;
+    const credentialsReady = Boolean(vps.credentials_ready ?? liveVm?.credentialsConfigured);
+
+    if (effectiveStatus === 'Failed') {
+      return res.status(422).json({
+        success: false,
+        code: 'PROVISIONING_FAILED',
+        error: vps.failure_reason || liveVm?.failureReason || 'VPS provisioning failed; credentials are unavailable.',
+      });
+    }
+
+    if (effectiveStatus !== 'Ready' || !credentialsReady) {
+      return res.status(409).json({
+        success: false,
+        code: 'VPS_NOT_READY',
+        error: `VPS provisioning or guest credential configuration is not complete yet (status: ${effectiveStatus}).`,
+      });
+    }
+
+    const mode = req.body?.mode === 'recovery' ? 'recovery' : 'initial';
+    if (mode === 'initial' && vps.credential_delivered_at) {
+      return res.status(409).json({
+        success: false,
+        code: 'CREDENTIAL_ALREADY_DELIVERED',
+        error: 'Initial credentials for this VPS have already been retrieved.',
+      });
+    }
+
+    if (mode === 'recovery' && vps.ephemeral_delivered) {
+      return res.status(409).json({
+        success: false,
+        code: 'CREDENTIAL_ALREADY_DELIVERED',
+        error: 'Credentials for this VPS were already delivered privately.',
+      });
+    }
+
+    try {
+      const credentials = vault.retrieve({
+        vpsId,
+        actorDiscordUserId: auth.discordUserId,
+        isAuthorizedAdmin,
+        mode,
+      });
+
+      await store.markVpsDeliveryState(
+        vpsId,
+        { discordUserId: auth.discordUserId, isAuthorizedAdmin },
+        { credentialDeliveredAt: new Date().toISOString() }
+      );
+
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(200).json({
+        success: true,
+        credentials,
+      });
+    } catch (err) {
+      return handleRegistryOrServerError(res, err, 'Retrieve VPS credentials');
+    }
+  });
+
+  // Delivery state tracking to prevent duplicate announcements/deliveries and purge vault on ephemeral success
+  router.post('/vps/:vpsId/delivery-status', authMiddleware, ensureAuthenticatedUser, async (req: Request, res: Response) => {
+    const auth = req.discordAuth!;
+    const vpsId = req.params.vpsId;
+    const body = req.body;
+
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_BODY',
+        error: 'Request body must be a valid JSON object.',
+      });
+    }
+
+    const isAuthorizedAdmin = auth.discordUserId === AUTHORIZED_ADMIN_ID;
+
+    try {
+      const updated = await store.markVpsDeliveryState(
+        vpsId,
+        { discordUserId: auth.discordUserId, isAuthorizedAdmin },
+        {
+          publicAnnouncementSent:
+            typeof body.public_announcement_sent === 'boolean' ? body.public_announcement_sent : undefined,
+          ephemeralDelivered:
+            typeof body.ephemeral_delivered === 'boolean' ? body.ephemeral_delivered : undefined,
+          ephemeralFailed:
+            typeof body.ephemeral_failed === 'boolean' ? body.ephemeral_failed : undefined,
+        }
+      );
+
+      if (body.ephemeral_delivered === true) {
+        vault.purge(vpsId);
+      } else if (body.ephemeral_failed === true) {
+        vault.markRecoveryAllowed(vpsId);
+      }
+
+      return res.status(200).json({
+        success: true,
+        vps: formatVpsResponse(updated, vmAdapter.getVm(vpsId)),
+      });
+    } catch (err) {
+      return handleRegistryOrServerError(res, err, 'Update VPS delivery status');
+    }
   });
 
   router.patch('/vps/:vpsId', authMiddleware, ensureAuthenticatedUser, async (req: Request, res: Response) => {
@@ -635,6 +837,7 @@ export function createManagementRouter(deps: {
     const vpsId = req.params.vpsId;
 
     try {
+      vault.purge(vpsId);
       const deleted = await store.deleteVpsRecord(
         vpsId,
         { discordUserId: auth.discordUserId, isAdmin: auth.isAdmin },

@@ -247,7 +247,7 @@ apiRouter.get('/rdp-download', (_req: Request, res: Response) => {
  */
 apiRouter.get('/vms', (_req: Request, res: Response) => {
   const vms = vmManager.getAllVms().map((vm) =>
-    vm.isPolicyManaged ? sanitizePublicRecord(vm as unknown as Record<string, unknown>) : vm
+    vm.isPolicyManaged || vm.isApiManaged ? sanitizePublicRecord(vm as unknown as Record<string, unknown>) : vm
   );
   return res.json({ success: true, vms });
 });
@@ -283,7 +283,10 @@ apiRouter.post('/vms', async (req: Request, res: Response) => {
 apiRouter.get('/vms/:id', (req: Request, res: Response) => {
   const vm = vmManager.getVm(req.params.id);
   if (!vm) return res.status(404).json({ success: false, error: 'VM not found' });
-  const safeVm = vm.isPolicyManaged ? sanitizePublicRecord(vm as unknown as Record<string, unknown>) : vm;
+  const safeVm =
+    vm.isPolicyManaged || vm.isApiManaged
+      ? sanitizePublicRecord(vm as unknown as Record<string, unknown>)
+      : vm;
   return res.json({ success: true, vm: safeVm });
 });
 

@@ -5,7 +5,7 @@ import { networkManager } from './network';
 import { rdpHealthChecker, RdpHealthResult } from './rdpHealth';
 import { serverLogger } from './logger';
 import { probeHostInfrastructure } from './infrastructure';
-import { generateWindowsPassword } from '../utils/credentials';
+import { generateWindowsPassword, validateWindowsPassword } from '../utils/credentials';
 import { tunnelManager } from './tunnel';
 import { rdpServiceManager } from './rdpService';
 import { imageManager, SupportedOsId } from './imageManager';
@@ -54,6 +54,16 @@ export interface VmRecord {
   rdpHealth?: RdpHealthResult;
   isExternalVerified?: boolean;
   isPolicyManaged?: boolean;
+  isApiManaged?: boolean;
+  credentialsConfigured?: boolean;
+  credentialsConfiguredAt?: string;
+  provisioningCompletedAt?: string;
+  failureReason?: string;
+}
+
+export interface VmProvisioningCallbacks {
+  onProvisioned?: (vm: VmRecord, actualPassword: string) => void;
+  onProvisionFailed?: (vm: VmRecord, reason: string) => void;
 }
 
 export class VmManager {
@@ -62,6 +72,8 @@ export class VmManager {
   private primaryVmId = 'vm-moon-win-01';
   private vmLocks: Set<string> = new Set();
   private healthCheckInterval: NodeJS.Timeout | null = null;
+  private provisioningCallbacks: Map<string, VmProvisioningCallbacks> = new Map();
+  private runtimePasswords: Map<string, string> = new Map();
 
   constructor() {
     const dataDir = path.resolve(process.cwd(), 'data');
@@ -107,8 +119,12 @@ export class VmManager {
 
   private saveState(): void {
     try {
-      const array = Array.from(this.vms.values());
-      fs.writeFileSync(this.stateFilePath, JSON.stringify(array, null, 2), 'utf8');
+      const array = Array.from(this.vms.values()).map((vm) =>
+        vm.isApiManaged || vm.isPolicyManaged
+          ? { ...vm, password: '[VAULT_PROTECTED]' }
+          : vm
+      );
+      fs.writeFileSync(this.stateFilePath, JSON.stringify(array, null, 2), { encoding: 'utf8', mode: 0o600 });
     } catch (err) {
       serverLogger.error('VMManager', `Failed to save state: ${err}`);
     }
@@ -162,6 +178,9 @@ export class VmManager {
     diskGb?: number;
     username?: string;
     useDefaultCredentialPolicy?: boolean;
+    generateUniqueCredentials?: boolean;
+    onProvisioned?: (vm: VmRecord, actualPassword: string) => void;
+    onProvisionFailed?: (vm: VmRecord, reason: string) => void;
   }): Promise<VmRecord> {
     const osDef = imageManager.getOsDefinition(options.osId);
     if (!osDef) {
@@ -175,17 +194,32 @@ export class VmManager {
     const memoryMb = options.memoryMb || osDef.recommendedRamMb;
     const diskGb = options.diskGb || osDef.minDiskGb;
     const username = options.username || osDef.defaultUsername;
-    const isPolicyManaged = Boolean(options.useDefaultCredentialPolicy);
-    const password = isPolicyManaged ? '[POLICY_MANAGED]' : generateWindowsPassword(16);
+    const isApiManaged = Boolean(options.generateUniqueCredentials);
+    const isPolicyManaged = Boolean(options.useDefaultCredentialPolicy) && !isApiManaged;
+
+    const actualPassword = isPolicyManaged
+      ? getDefaultProvisioningPassword()
+      : generateWindowsPassword(16);
+
+    serverLogger.registerSecret(actualPassword);
+
+    if (isApiManaged) {
+      this.runtimePasswords.set(vmId, actualPassword);
+    }
+    if (options.onProvisioned || options.onProvisionFailed) {
+      this.provisioningCallbacks.set(vmId, {
+        onProvisioned: options.onProvisioned,
+        onProvisionFailed: options.onProvisionFailed,
+      });
+    }
+
+    const storedRecordPassword = (isApiManaged || isPolicyManaged) ? '[VAULT_PROTECTED]' : actualPassword;
 
     // Dynamic port allocation: Debian 12 primary uses 3389; Windows 7 and new VMs allocate a distinct local port
     const localPort = (options.id === this.primaryVmId && options.osId === 'debian-12')
       ? 3389
       : networkManager.allocatePort(vmId);
 
-    if (!isPolicyManaged) {
-      serverLogger.registerSecret(password);
-    }
     serverLogger.info(
       'VMManager',
       `Queued creation for new VM: ${name} [${options.osId}] (RAM: ${memoryMb}MB, Cores: ${cores}, Disk: ${diskGb}GB, LocalPort: ${localPort})`,
@@ -205,7 +239,7 @@ export class VmManager {
       memoryMb,
       diskGb,
       username,
-      password,
+      password: storedRecordPassword,
       localPort,
       ipAddress: realIp,
       publicEndpoint: `${realIp}:${localPort}`,
@@ -223,6 +257,8 @@ export class VmManager {
       updatedAt: now,
       isExternalVerified: false,
       isPolicyManaged,
+      isApiManaged,
+      credentialsConfigured: false,
     };
 
     this.vms.set(vmId, record);
@@ -236,9 +272,57 @@ export class VmManager {
     return record;
   }
 
+  private prepareWindowsGuestCredentialsPayload(vm: VmRecord, password: string): void {
+    const check = validateWindowsPassword(password);
+    if (!check.valid) {
+      throw new Error(`Generated Windows 7 password failed complexity policy: ${check.reason}`);
+    }
+
+    const escapedPwd = password
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+
+    const provDir = path.resolve(process.cwd(), 'data', 'provisioning', vm.id);
+    fs.mkdirSync(provDir, { recursive: true, mode: 0o700 });
+
+    const autounattendXml = [
+      '<?xml version="1.0" encoding="utf-8"?>',
+      '<unattend xmlns="urn:schemas-microsoft-com:unattend">',
+      '  <settings pass="oobeSystem">',
+      '    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">',
+      '      <UserAccounts>',
+      '        <AdministratorPassword>',
+      `          <Value>${escapedPwd}</Value>`,
+      '          <PlainText>true</PlainText>',
+      '        </AdministratorPassword>',
+      '      </UserAccounts>',
+      '      <AutoLogon>',
+      '        <Enabled>true</Enabled>',
+      `        <Username>${vm.username}</Username>`,
+      '      </AutoLogon>',
+      '    </component>',
+      '  </settings>',
+      '</unattend>',
+      '',
+    ].join('\n');
+
+    fs.writeFileSync(path.join(provDir, 'Autounattend.xml'), autounattendXml, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    serverLogger.info('Provisioner', `Prepared restricted Windows 7 credential unattend package for ${vm.id}`, vm.id);
+  }
+
   private async executeProvisioningPipeline(vmId: string): Promise<void> {
     const vm = this.vms.get(vmId);
     if (!vm) return;
+
+    const callbacks = this.provisioningCallbacks.get(vmId);
+    const effectivePwd =
+      this.runtimePasswords.get(vmId) ||
+      (vm.isPolicyManaged ? getDefaultProvisioningPassword() : vm.password);
 
     try {
       // 1. Preparing
@@ -266,21 +350,28 @@ export class VmManager {
       serverLogger.info('Provisioner', `[Stage 3/5] Allocating storage...`, vmId);
       hypervisor.prepareDisk(vmId, vm.diskGb);
 
-      // 4. Installing / Booting
+      // 4. Installing / Configuring Guest Credentials & Booting
       if (!this.vms.has(vmId)) return;
       vm.status = 'Booting';
-      vm.statusMessage = 'Đang khởi động dịch vụ hệ điều hành...';
+      vm.statusMessage = 'Đang khởi động dịch vụ hệ điều hành và cấu hình tài khoản truy cập...';
       this.saveState();
-      serverLogger.info('Provisioner', `[Stage 4/5] Launching hypervisor process (status: ${vm.status})...`, vmId);
+      serverLogger.info('Provisioner', `[Stage 4/5] Configuring guest credentials and launching hypervisor...`, vmId);
+
+      if (!effectivePwd || effectivePwd === '[POLICY_MANAGED]' || effectivePwd === '[VAULT_PROTECTED]') {
+        throw new Error('Missing valid runtime guest password for credential provisioning.');
+      }
 
       if (vm.osId === 'debian-12') {
-        const effectivePwd = vm.isPolicyManaged ? getDefaultProvisioningPassword() : vm.password;
-        await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd);
+        await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd, {
+          strictPasswordSync: Boolean(vm.isApiManaged),
+        });
+      } else if (vm.osId === 'windows-7') {
+        this.prepareWindowsGuestCredentialsPayload(vm, effectivePwd);
       }
 
       if (!this.vms.has(vmId)) return;
 
-      await hypervisor.startVmProcess({
+      const procInfo = await hypervisor.startVmProcess({
         vmId: vm.id,
         osId: vm.osId,
         hostPort: vm.localPort,
@@ -288,6 +379,10 @@ export class VmManager {
         cores: vm.cores,
         isoPath,
       });
+
+      if (procInfo.status === 'ERROR' || !procInfo.pid) {
+        throw new Error(`Hypervisor process failed to enter RUNNING state for ${vm.osId}.`);
+      }
 
       // 5. Running & Public Network Synchronization with dedicated distinct port
       const isWin7 = vm.osId === 'windows-7';
@@ -298,23 +393,48 @@ export class VmManager {
       const assignedPort = tunnel.publicPort || vm.localPort;
       const assignedHost = tunnel.publicHost || '159.223.110.159';
       const endpoint = `${assignedHost}:${assignedPort}`;
+      const completedAt = new Date().toISOString();
 
+      vm.credentialsConfigured = true;
+      vm.credentialsConfiguredAt = completedAt;
+      vm.provisioningCompletedAt = completedAt;
       vm.status = 'Ready';
-      vm.lastBootAt = new Date().toISOString();
+      vm.lastBootAt = completedAt;
       vm.ipAddress = assignedHost;
       vm.publicEndpoint = endpoint;
       vm.statusMessage = isWin7
         ? `Máy ảo Windows 7 SP1 đã khởi chạy thành công trên QEMU với cổng riêng biệt mới: ${endpoint}.`
         : 'Máy chủ đang hoạt động bình thường trên hạ tầng Google Cloud.';
       vm.isExternalVerified = true;
-      vm.updatedAt = new Date().toISOString();
+      vm.updatedAt = completedAt;
+
+      // Deliver credentials into encrypted server vault BEFORE clearing ephemeral memory password
+      if (callbacks?.onProvisioned) {
+        callbacks.onProvisioned(vm, effectivePwd);
+      }
+      if (vm.isApiManaged) {
+        this.runtimePasswords.delete(vmId);
+        vm.password = '[VAULT_PROTECTED]';
+      }
+      this.provisioningCallbacks.delete(vmId);
+
       this.saveState();
-      serverLogger.info('Provisioner', `[Stage 5/5] VM online with verified endpoint: ${endpoint}`, vmId);
+      serverLogger.info('Provisioner', `[Stage 5/5] VM online with configured credentials and endpoint: ${endpoint}`, vmId);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       vm.status = 'Failed';
+      vm.credentialsConfigured = false;
+      vm.failureReason = msg;
       vm.statusMessage = `Khởi tạo thất bại: ${msg}`;
       vm.updatedAt = new Date().toISOString();
+      this.runtimePasswords.delete(vmId);
+      if (vm.isApiManaged) {
+        vm.password = '[VAULT_PROTECTED]';
+      }
+      if (callbacks?.onProvisionFailed) {
+        callbacks.onProvisionFailed(vm, msg);
+      }
+      this.provisioningCallbacks.delete(vmId);
       this.saveState();
       serverLogger.error('Provisioner', `Provisioning failed: ${msg}`, vmId);
     }
@@ -366,8 +486,11 @@ export class VmManager {
       this.saveState();
 
       if (vm.osId === 'debian-12') {
+        const isProtected = vm.password === '[VAULT_PROTECTED]' || vm.password === '[POLICY_MANAGED]';
         const effectivePwd = vm.isPolicyManaged ? getDefaultProvisioningPassword() : vm.password;
-        await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd);
+        await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd, {
+          skipPasswordReset: vm.isApiManaged && isProtected,
+        });
       }
 
       const isoPath = path.join(path.resolve(process.cwd(), 'data/iso'), vm.imageId);
@@ -448,8 +571,11 @@ export class VmManager {
       }
 
       if (vm.osId === 'debian-12') {
+        const isProtected = vm.password === '[VAULT_PROTECTED]' || vm.password === '[POLICY_MANAGED]';
         const effectivePwd = vm.isPolicyManaged ? getDefaultProvisioningPassword() : vm.password;
-        await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd);
+        await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd, {
+          skipPasswordReset: vm.isApiManaged && isProtected,
+        });
       }
 
       await tunnelManager.startTunnelForVm(vm.id, vm.localPort, {
@@ -495,6 +621,16 @@ export class VmManager {
       await hypervisor.forceStop(vmId);
       tunnelManager.stop(vmId);
       networkManager.releasePort(vm.localPort, vmId);
+      this.runtimePasswords.delete(vmId);
+      this.provisioningCallbacks.delete(vmId);
+      try {
+        const provDir = path.resolve(process.cwd(), 'data', 'provisioning', vmId);
+        if (fs.existsSync(provDir)) {
+          fs.rmSync(provDir, { recursive: true, force: true });
+        }
+      } catch {
+        // ignore
+      }
       this.vms.delete(vmId);
       this.saveState();
       return true;
@@ -514,8 +650,15 @@ export class VmManager {
       serverLogger.info('VMManager', `Rebuilding virtual machine environment for ${vmId}...`, vmId);
       await hypervisor.forceStop(vmId);
 
-      vm.password = generateWindowsPassword(16);
-      serverLogger.registerSecret(vm.password);
+      const newPwd = generateWindowsPassword(16);
+      serverLogger.registerSecret(newPwd);
+      if (vm.isApiManaged) {
+        this.runtimePasswords.set(vmId, newPwd);
+        vm.password = '[VAULT_PROTECTED]';
+      } else {
+        vm.password = newPwd;
+      }
+      vm.credentialsConfigured = false;
       vm.status = 'Preparing';
       vm.statusMessage = 'Đang xây dựng lại hệ thống...';
       vm.updatedAt = new Date().toISOString();
@@ -546,8 +689,11 @@ export class VmManager {
 
     // 1. Ensure local service listener is active
     if (vm.osId === 'debian-12') {
+      const isProtected = vm.password === '[VAULT_PROTECTED]' || vm.password === '[POLICY_MANAGED]';
       const effectivePwd = vm.isPolicyManaged ? getDefaultProvisioningPassword() : vm.password;
-      await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd);
+      await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd, {
+        skipPasswordReset: vm.isApiManaged && isProtected,
+      });
     } else if (vm.osId === 'windows-7') {
       const proc = hypervisor.getVmProcess(vm.id);
       const isRunning = proc && proc.pid ? true : false;

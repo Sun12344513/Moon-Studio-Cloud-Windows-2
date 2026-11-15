@@ -58,6 +58,14 @@ export interface VpsRecord {
   password_hash: string;
   created_at: string;
   updated_at: string;
+  completed_at?: string | null;
+  credentials_ready?: boolean;
+  credential_delivered_at?: string | null;
+  public_announcement_sent?: boolean;
+  ephemeral_delivered?: boolean;
+  ephemeral_failed?: boolean;
+  failure_reason?: string | null;
+  idempotency_key?: string | null;
 }
 
 export interface AdminTestModeState {
@@ -590,17 +598,57 @@ export class RegistryStore {
     memoryMb?: number;
     diskGb?: number;
     machineId?: string;
+    idempotencyKey?: string;
     provisionVm: (args: {
       osId: 'debian-12' | 'windows-7';
       name: string;
       cores: number;
       memoryMb: number;
       diskGb: number;
-    }) => Promise<{ vmId: string; status: string }>;
-  }): Promise<{ vps: Omit<VpsRecord, 'password_hash'>; machine: MachineRecord }> {
+    }) => Promise<{
+      vmId: string;
+      status: string;
+      passwordHash?: string;
+      credentialsReady?: boolean;
+      completedAt?: string | null;
+    }>;
+  }): Promise<{
+    vps: Omit<VpsRecord, 'password_hash'>;
+    machine: MachineRecord;
+    idempotentReplay: boolean;
+  }> {
     return this.withTransactionLock(async () => {
       if (params.osId !== 'debian-12' && params.osId !== 'windows-7') {
         throw new RegistryError(400, 'INVALID_OS', "os_id must be 'debian-12' or 'windows-7'.");
+      }
+
+      const cleanIdempotencyKey = params.idempotencyKey?.trim().slice(0, 128) || undefined;
+      if (cleanIdempotencyKey) {
+        const existingReplay = Array.from(this.vpsRecords.values()).find(
+          (v) => v.discord_user_id === params.discordUserId && v.idempotency_key === cleanIdempotencyKey
+        );
+        if (existingReplay) {
+          const existingMachine = this.machines.get(existingReplay.machine_id.toLowerCase()) || {
+            machine_id: existingReplay.machine_id,
+            discord_user_id: existingReplay.discord_user_id,
+            name: `Node-${existingReplay.machine_id}`,
+            os_id: existingReplay.os_id,
+            specs: {
+              cores: existingReplay.cores,
+              memory_mb: existingReplay.memory_mb,
+              disk_gb: existingReplay.disk_gb,
+            },
+            region: 'asia-east1',
+            status: 'active' as MachineStatus,
+            registered_at: existingReplay.created_at,
+            updated_at: existingReplay.updated_at,
+          };
+          return {
+            vps: sanitizePublicRecord(existingReplay),
+            machine: { ...existingMachine, specs: { ...existingMachine.specs } },
+            idempotentReplay: true,
+          };
+        }
       }
 
       // Enforce 600s cooldown per Discord User ID
@@ -700,9 +748,17 @@ export class RegistryStore {
         memory_mb: memoryMb,
         disk_gb: diskGb,
         status: provisioned.status,
-        password_hash: createDefaultPasswordHash(),
+        password_hash: provisioned.passwordHash || createDefaultPasswordHash(),
         created_at: nowIso,
         updated_at: nowIso,
+        completed_at: provisioned.completedAt ?? null,
+        credentials_ready: Boolean(provisioned.credentialsReady),
+        credential_delivered_at: null,
+        public_announcement_sent: false,
+        ephemeral_delivered: false,
+        ephemeral_failed: false,
+        failure_reason: null,
+        idempotency_key: cleanIdempotencyKey || null,
       };
 
       if (newlyRegisteredMachine) {
@@ -721,7 +777,73 @@ export class RegistryStore {
       return {
         vps: sanitizePublicRecord(vpsRecord),
         machine: { ...machineRecord, specs: { ...machineRecord.specs } },
+        idempotentReplay: false,
       };
+    });
+  }
+
+  public async markVpsProvisioningState(
+    vpsId: string,
+    updates: {
+      status?: string;
+      credentialsReady?: boolean;
+      completedAt?: string | null;
+      failureReason?: string | null;
+      passwordHash?: string;
+    }
+  ): Promise<Omit<VpsRecord, 'password_hash'> | undefined> {
+    return this.withTransactionLock(() => {
+      const vps = this.vpsRecords.get(vpsId);
+      if (!vps) return undefined;
+
+      if (updates.status !== undefined) vps.status = updates.status;
+      if (updates.credentialsReady !== undefined) vps.credentials_ready = updates.credentialsReady;
+      if (updates.completedAt !== undefined) vps.completed_at = updates.completedAt;
+      if (updates.failureReason !== undefined) vps.failure_reason = updates.failureReason;
+      if (updates.passwordHash !== undefined) vps.password_hash = updates.passwordHash;
+      vps.updated_at = new Date(this.nowProvider()).toISOString();
+      this.saveToDisk();
+      return sanitizePublicRecord(vps);
+    });
+  }
+
+  public async markVpsDeliveryState(
+    vpsId: string,
+    actor: { discordUserId: string; isAuthorizedAdmin: boolean },
+    updates: {
+      publicAnnouncementSent?: boolean;
+      ephemeralDelivered?: boolean;
+      ephemeralFailed?: boolean;
+      credentialDeliveredAt?: string | null;
+    }
+  ): Promise<Omit<VpsRecord, 'password_hash'>> {
+    return this.withTransactionLock(() => {
+      const vps = this.vpsRecords.get(vpsId);
+      if (!vps) {
+        throw new RegistryError(404, 'VPS_NOT_FOUND', `VPS '${vpsId}' not found.`);
+      }
+      if (vps.discord_user_id !== actor.discordUserId && !actor.isAuthorizedAdmin) {
+        throw new RegistryError(403, 'FORBIDDEN', 'You do not have permission to update delivery status for this VPS.');
+      }
+
+      if (updates.publicAnnouncementSent !== undefined) {
+        vps.public_announcement_sent = updates.publicAnnouncementSent;
+      }
+      if (updates.ephemeralDelivered !== undefined) {
+        vps.ephemeral_delivered = updates.ephemeralDelivered;
+        if (updates.ephemeralDelivered) {
+          vps.ephemeral_failed = false;
+        }
+      }
+      if (updates.ephemeralFailed !== undefined) {
+        vps.ephemeral_failed = updates.ephemeralFailed;
+      }
+      if (updates.credentialDeliveredAt !== undefined) {
+        vps.credential_delivered_at = updates.credentialDeliveredAt;
+      }
+      vps.updated_at = new Date(this.nowProvider()).toISOString();
+      this.saveToDisk();
+      return sanitizePublicRecord(vps);
     });
   }
 

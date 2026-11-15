@@ -81,7 +81,7 @@ npm start
 On successful startup, the console logs:
 - Authenticated Discord bot tag and ID
 - Target `API_BASE_URL`
-- Number of registered Slash Commands (`16` commands)
+- Number of registered Slash Commands (`17` commands)
 
 For continuous production hosting on a VPS, run it under a process manager such as `pm2` or `systemd`:
 
@@ -111,12 +111,13 @@ Slash commands are automatically re-synchronized on startup.
 
 ## 6. Available Slash Commands
 
-All bot responses, confirmations, errors, and cooldown notices strictly use **Discord Embeds** (zero plain-text replies). Default provisioning passwords are enforced server-side and never displayed in Embeds or logs.
+All bot responses, confirmations, errors, and cooldown notices strictly use **Discord Embeds** (zero plain-text replies). VPS passwords are generated and configured inside the guest OS server-side before Ready status and delivered exclusively via **Private Ephemeral Embed** to the creator (`Your Moon Studio VPS Credentials`)—never via public channel messages, public endpoints, DMs, or logs.
 
 ### VPS Management
-- `/create-vps` — Provision a new Cloud VPS (`debian-12` or `windows-7`) with optional `name`, `cores`, `memory_mb`, `disk_gb`, and `machine_id`. Subject to the 600-second cooldown.
+- `/create-vps` — Provision a new Cloud VPS (`debian-12` or `windows-7`) with optional `name`, `cores`, `memory_mb`, `disk_gb`, and `machine_id`. On completion, sends a credential-free public announcement in the invoking channel and delivers actual login credentials privately in an Ephemeral Embed to the creator. Subject to the 600-second cooldown.
+- `/get-vps-credentials` — Private Ephemeral recovery of undelivered VPS credentials if the initial `/create-vps` Ephemeral reply expired or failed (owner-only, single recovery).
 - `/list-vps` — List your active Cloud VPS instances (`all: true` available to admins).
-- `/vps-info` — Inspect live status, specs, and public endpoint for a specific `vps_id`.
+- `/vps-info` — Inspect live status, specs, and public endpoint for a specific `vps_id` (credentials are never included).
 - `/vps-power` — Execute `start`, `shutdown`, `restart`, `force-stop`, `rebuild`, or `reload-ip`, or rename a VPS.
 - `/delete` — Permanently delete one of your Cloud VPS instances by `vps_id`.
 

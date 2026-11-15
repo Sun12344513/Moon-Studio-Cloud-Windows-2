@@ -8,27 +8,44 @@ import path from 'node:path';
 import { createManagementRouter, VmLifecycleAdapter } from './managementApi';
 import { RegistryStore } from './registryStore';
 import { AUTHORIZED_ADMIN_ID } from './botAuth';
-import { getDefaultProvisioningPassword } from './credentialPolicy';
+import { CredentialVault, getDefaultProvisioningPassword, verifyPasswordScrypt } from './credentialPolicy';
+import { generateWindowsPassword } from '../utils/credentials';
 import { VmRecord } from './vmManager';
+import { RdpServiceManager } from './rdpService';
+import { MessageFlags } from 'discord.js';
 
-function createBotTestVmAdapter(): VmLifecycleAdapter {
+function createBotTestVmAdapter(options?: {
+  delayMs?: number;
+  shouldFail?: (osId: string) => string | null;
+}): VmLifecycleAdapter & { getGeneratedPassword: (id: string) => string | undefined } {
   const vms = new Map<string, VmRecord>();
+  const generatedPasswords = new Map<string, string>();
   let seq = 1;
+
   return {
-    async createVm(options) {
-      const id = options.id || `vm-${options.osId}-bot${seq++}`;
+    async createVm(createOpts) {
+      const id = createOpts.id || `vm-${createOpts.osId}-bot${seq++}`;
+      const actualPassword = createOpts.generateUniqueCredentials
+        ? generateWindowsPassword(16)
+        : getDefaultProvisioningPassword();
+      generatedPasswords.set(id, actualPassword);
+
+      const failMsg = options?.shouldFail?.(createOpts.osId) || null;
+      const delayMs = options?.delayMs || 0;
+      const now = new Date().toISOString();
+
       const rec: VmRecord = {
         id,
-        name: options.name || `VM ${id}`,
-        osId: options.osId,
-        osName: options.osId === 'windows-7' ? 'Windows 7' : 'Debian 12',
+        name: createOpts.name || `VM ${id}`,
+        osId: createOpts.osId,
+        osName: createOpts.osId === 'windows-7' ? 'Windows 7' : 'Debian 12',
         version: '12',
         imageId: 'test.iso',
-        cores: options.cores || 2,
-        memoryMb: options.memoryMb || 2048,
-        diskGb: options.diskGb || 40,
+        cores: createOpts.cores || 2,
+        memoryMb: createOpts.memoryMb || 2048,
+        diskGb: createOpts.diskGb || 40,
         username: 'Administrator',
-        password: '[POLICY_MANAGED]',
+        password: '[VAULT_PROTECTED]',
         localPort: 3400 + seq,
         ipAddress: '159.223.110.159',
         publicEndpoint: `159.223.110.159:${3400 + seq}`,
@@ -39,14 +56,44 @@ function createBotTestVmAdapter(): VmLifecycleAdapter {
           guestPort: 3389,
           natForwarding: true,
         },
-        status: 'Ready',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
+        status: delayMs > 0 ? 'Booting' : failMsg ? 'Failed' : 'Ready',
+        createdAt: now,
+        updatedAt: now,
         isPolicyManaged: true,
+        isApiManaged: true,
+        credentialsConfigured: delayMs === 0 && !failMsg,
+        credentialsConfiguredAt: delayMs === 0 && !failMsg ? now : undefined,
+        provisioningCompletedAt: delayMs === 0 && !failMsg ? now : undefined,
+        failureReason: delayMs === 0 && failMsg ? failMsg : undefined,
       };
       vms.set(id, rec);
+
+      if (delayMs > 0) {
+        setTimeout(() => {
+          const completedAt = new Date().toISOString();
+          if (failMsg) {
+            rec.status = 'Failed';
+            rec.credentialsConfigured = false;
+            rec.failureReason = failMsg;
+            createOpts.onProvisionFailed?.(rec, failMsg);
+          } else {
+            rec.status = 'Ready';
+            rec.credentialsConfigured = true;
+            rec.credentialsConfiguredAt = completedAt;
+            rec.provisioningCompletedAt = completedAt;
+            rec.updatedAt = completedAt;
+            createOpts.onProvisioned?.(rec, actualPassword);
+          }
+        }, delayMs);
+      } else if (failMsg) {
+        createOpts.onProvisionFailed?.(rec, failMsg);
+      } else {
+        createOpts.onProvisioned?.(rec, actualPassword);
+      }
+
       return rec;
     },
+    getGeneratedPassword: (id: string) => generatedPasswords.get(id),
     getVm: (id) => vms.get(id),
     startVm: async (id) => vms.has(id),
     shutdownVm: async (id) => vms.has(id),
@@ -78,39 +125,74 @@ interface CapturedPayload {
 }
 
 function createMockInteraction(params: {
+  id?: string;
   commandName: string;
   userId: string;
   username?: string;
+  displayName?: string;
   strings?: Record<string, string>;
   integers?: Record<string, number>;
   booleans?: Record<string, boolean>;
   users?: Record<string, { id: string; username: string }>;
   subcommand?: string;
   isDiscordAdmin?: boolean;
+  failChannelSend?: boolean;
+  failEphemeralEditReply?: boolean;
+  forbiddenSecret?: string;
 }) {
   const defaultPassword = getDefaultProvisioningPassword();
   const captured: CapturedPayload[] = [];
+  const publicMessages: CapturedPayload[] = [];
   let deferred = false;
+  let deferredEphemeral = false;
   let replied = false;
 
-  const assertEmbedOnly = (payload: CapturedPayload) => {
+  const assertEmbedOnly = (payload: CapturedPayload, isPublic: boolean) => {
     assert.equal(payload.content, undefined, `Command /${params.commandName} MUST NOT send plain-text content`);
     assert.ok(Array.isArray(payload.embeds) && payload.embeds.length > 0, `Command /${params.commandName} MUST send embeds`);
     const jsonStr = JSON.stringify(payload.embeds.map((e) => (e.toJSON ? e.toJSON() : e)));
-    assert.equal(jsonStr.includes(defaultPassword), false, 'Discord Embed MUST NEVER expose password');
+    assert.equal(jsonStr.includes(defaultPassword), false, 'Discord Embed MUST NEVER expose hardcoded default password');
+    assert.equal(jsonStr.includes('[POLICY_MANAGED]'), false, 'Discord Embed MUST NEVER expose [POLICY_MANAGED]');
+    if (params.forbiddenSecret) {
+      assert.equal(jsonStr.includes(params.forbiddenSecret), false, 'Discord Embed MUST NEVER leak botSecret');
+    }
+    if (isPublic) {
+      assert.equal(jsonStr.includes('Password'), false, 'Public channel embed MUST NEVER contain Password field');
+      assert.equal(jsonStr.includes('159.223.110.159'), false, 'Public channel embed MUST NEVER contain IP address');
+      assert.equal(jsonStr.includes('Administrator'), false, 'Public channel embed MUST NEVER contain VPS username');
+    }
   };
 
   const interaction = {
+    id: params.id || `int-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
     commandName: params.commandName,
     user: {
       id: params.userId,
-      username: params.username || `Tester-${params.userId.slice(-4)}`,
+      username: params.username || `tester_${params.userId.slice(-4)}`,
+      globalName: params.displayName || `Display ${params.userId.slice(-4)}`,
+    },
+    member: {
+      displayName: params.displayName || `Display ${params.userId.slice(-4)}`,
     },
     memberPermissions: {
       has: () => Boolean(params.isDiscordAdmin),
     },
+    channel: {
+      id: 'channel-current-001',
+      send: async (payload: CapturedPayload) => {
+        if (params.failChannelSend) {
+          throw new Error('Missing Permissions (50013)');
+        }
+        assertEmbedOnly(payload, true);
+        publicMessages.push(payload);
+        return payload;
+      },
+    },
     get deferred() {
       return deferred;
+    },
+    get deferredEphemeral() {
+      return deferredEphemeral;
     },
     get replied() {
       return replied;
@@ -135,23 +217,30 @@ function createMockInteraction(params: {
       },
       getSubcommand: () => params.subcommand || '',
     },
-    deferReply: async () => {
+    deferReply: async (opts?: { flags?: number }) => {
       deferred = true;
+      deferredEphemeral = Boolean(opts?.flags && (opts.flags & MessageFlags.Ephemeral));
     },
     reply: async (payload: CapturedPayload) => {
-      assertEmbedOnly(payload);
+      assertEmbedOnly(payload, false);
       replied = true;
       captured.push(payload);
       return payload;
     },
     editReply: async (payload: CapturedPayload) => {
-      assertEmbedOnly(payload);
+      if (params.failEphemeralEditReply) {
+        const err = new Error('Unknown interaction');
+        (err as unknown as { code: number }).code = 10062;
+        throw err;
+      }
+      assert.equal(deferredEphemeral, true, 'Credential or command editReply MUST be on an Ephemeral deferred reply');
+      assertEmbedOnly(payload, false);
       replied = true;
-      captured.push(payload);
+      captured.push({ ...payload, flags: MessageFlags.Ephemeral });
       return payload;
     },
     followUp: async (payload: CapturedPayload) => {
-      assertEmbedOnly(payload);
+      assertEmbedOnly(payload, false);
       captured.push(payload);
       return payload;
     },
@@ -160,8 +249,14 @@ function createMockInteraction(params: {
   return {
     interaction,
     captured,
+    publicMessages,
     getLastEmbedJson() {
       const last = captured[captured.length - 1];
+      const emb = last?.embeds?.[0];
+      return emb?.toJSON ? emb.toJSON() : (emb as unknown as Record<string, unknown>);
+    },
+    getLastPublicEmbedJson() {
+      const last = publicMessages[publicMessages.length - 1];
       const emb = last?.embeds?.[0];
       return emb?.toJSON ? emb.toJSON() : (emb as unknown as Record<string, unknown>);
     },
@@ -212,13 +307,16 @@ test('Discord Bot commands enforce Embed-Only policy, permission checks, cooldow
   const userB = '222222222222222222';
   process.env.DISCORD_ADMIN_IDS = adminId;
 
+  const vmAdapter = createBotTestVmAdapter();
+  const vault = new CredentialVault();
   const app = express();
   app.use(express.json());
   app.use(
     '/api/v1',
     createManagementRouter({
       store,
-      vmAdapter: createBotTestVmAdapter(),
+      vmAdapter,
+      vault,
       getSecret: () => secret,
     })
   );
@@ -236,13 +334,16 @@ test('Discord Bot commands enforce Embed-Only policy, permission checks, cooldow
       apiBaseUrl,
       botSecret: secret,
       adminIds: new Set([adminId]),
+      pollIntervalMs: 20,
+      maxProvisionWaitMs: 5000,
     });
 
-    // Verify full command suite is registered (far beyond just /create-vps and /delete)
+    // Verify full command suite (17 slash commands including /get-vps-credentials)
     const expectedCommands = [
       'help',
       'status',
       'create-vps',
+      'get-vps-credentials',
       'delete',
       'list-vps',
       'vps-info',
@@ -263,28 +364,61 @@ test('Discord Bot commands enforce Embed-Only policy, permission checks, cooldow
     }
 
     // 1. /help -> Embed-only
-    const helpMock = createMockInteraction({ commandName: 'help', userId: userA });
+    const helpMock = createMockInteraction({ commandName: 'help', userId: userA, forbiddenSecret: secret });
     await ctx.handleInteraction(helpMock.interaction);
     assert.ok(String(helpMock.getLastEmbedJson().title).includes('Moon Studio'));
 
     // 2. /status -> Embed-only
-    const statusMock = createMockInteraction({ commandName: 'status', userId: userA });
+    const statusMock = createMockInteraction({ commandName: 'status', userId: userA, forbiddenSecret: secret });
     await ctx.handleInteraction(statusMock.interaction);
     assert.ok(String(statusMock.getLastEmbedJson().title).includes('Operational'));
 
-    // 3. /create-vps by User A -> creates VPS & responds with Embed
+    // 3. /create-vps (Debian 12) by User A -> Flow 1 public announcement + Flow 2 Private Ephemeral Credentials
     const createMock = createMockInteraction({
       commandName: 'create-vps',
       userId: userA,
+      username: 'alice_dev',
+      displayName: 'Alice Cloud',
       strings: { os: 'debian-12', name: 'Bot-Debian-VPS' },
       integers: { cores: 2, memory_mb: 2048, disk_gb: 40 },
+      forbiddenSecret: secret,
     });
     await ctx.handleInteraction(createMock.interaction);
+
+    // Flow 1: Public channel announcement contains ONLY user & OS (zero credentials)
+    assert.equal(createMock.publicMessages.length, 1);
+    const pubEmbed = createMock.getLastPublicEmbedJson();
+    assert.equal(pubEmbed.title, 'Moon Studio Cloud — VPS Provisioned');
+    const pubText = JSON.stringify(pubEmbed);
+    assert.ok(pubText.includes('Alice Cloud'));
+    assert.ok(pubText.includes('@alice_dev'));
+    assert.ok(pubText.includes(`<@${userA}>`));
+    assert.ok(pubText.includes('Debian 12'));
+
+    // Flow 2: Private Ephemeral Credentials
     const createEmbed = createMock.getLastEmbedJson();
-    assert.ok(String(createEmbed.title).includes('Provisioned Successfully'));
-    const vpsField = (createEmbed.fields as Array<{ name: string; value: string }>).find((f) => f.name === 'VPS ID');
-    assert.ok(vpsField);
+    assert.equal(createEmbed.title, 'Your Moon Studio VPS Credentials');
+    assert.equal(createMock.captured[createMock.captured.length - 1].flags, MessageFlags.Ephemeral);
+    const credFields = createEmbed.fields as Array<{ name: string; value: string }>;
+    const vpsField = credFields.find((f) => f.name === 'VPS ID');
+    const passField = credFields.find((f) => f.name === 'Password');
+    const ipField = credFields.find((f) => f.name === 'Public IP Address');
+    const userField = credFields.find((f) => f.name === 'Username');
+    const createdAtField = credFields.find((f) => f.name === 'Created At');
+    assert.ok(vpsField && passField && ipField && userField && createdAtField);
+
     const createdVpsId = vpsField.value.replace(/`/g, '').trim();
+    const deliveredPassword = passField.value.replace(/`/g, '').trim();
+    assert.equal(deliveredPassword, vmAdapter.getGeneratedPassword(createdVpsId));
+    const persistedRaw = fs.readFileSync(path.join(dir, 'registry.json'), 'utf8');
+    assert.equal(persistedRaw.includes(deliveredPassword), false, 'Persisted registry.json MUST NOT contain plaintext password');
+    const persistedJson = JSON.parse(persistedRaw) as { vpsList?: Array<{ vps_id: string; password_hash: string }> };
+    const storedVps = persistedJson.vpsList?.find((v) => v.vps_id === createdVpsId);
+    assert.ok(storedVps?.password_hash);
+    assert.equal(verifyPasswordScrypt(deliveredPassword, storedVps.password_hash), true);
+    assert.ok(createdAtField.value.includes('(Asia/Ho_Chi_Minh)'));
+    assert.equal(pubText.includes(deliveredPassword), false, 'Public channel MUST NOT contain actual password');
+    assert.equal(vault.hasActiveEntry(createdVpsId), false, 'Vault entry MUST be purged after Ephemeral delivery');
 
     // 4. User A immediately tries /register-machine -> hits 429 Cooldown Embed
     const cooldownMock = createMockInteraction({
@@ -407,14 +541,20 @@ test('Discord Bot commands enforce Embed-Only policy, permission checks, cooldow
     assert.equal(onEmbed.color, botMod.COLORS.TEST_MODE_ON);
     assert.ok(String(onEmbed.description).includes('enabled successfully'));
 
-    // Authorized Admin executes consecutive creation commands without cooldown
+    // Authorized Admin executes consecutive creation commands without cooldown (Windows 7 check)
     const adminVps = createMockInteraction({
       commandName: 'create-vps',
       userId: AUTHORIZED_ADMIN_ID,
-      strings: { os: 'debian-12', name: 'Admin-Rapid-1' },
+      username: 'moon_admin',
+      displayName: 'Moon Admin',
+      strings: { os: 'windows-7', name: 'Admin-Rapid-Win7' },
+      forbiddenSecret: secret,
     });
     await ctx.handleInteraction(adminVps.interaction);
-    assert.ok(String(adminVps.getLastEmbedJson().title).includes('Provisioned Successfully'));
+    assert.equal(adminVps.publicMessages.length, 1);
+    assert.ok(JSON.stringify(adminVps.getLastPublicEmbedJson()).includes('Windows 7'));
+    assert.equal(adminVps.getLastEmbedJson().title, 'Your Moon Studio VPS Credentials');
+    assert.ok(JSON.stringify(adminVps.getLastEmbedJson()).includes('Windows 7'));
 
     const adminMachine = createMockInteraction({
       commandName: 'register-machine',
@@ -463,6 +603,155 @@ test('Discord Bot commands enforce Embed-Only policy, permission checks, cooldow
     assert.ok(String(adminBlockedAfterOff.getLastEmbedJson().title).includes('Cooldown Active'));
   } finally {
     delete process.env.DISCORD_ADMIN_IDS;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Discord Bot handles async provisioning, channel failure isolation, provisioning failures, and private Ephemeral recovery', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moon-bot-flow-test-'));
+  const store = new RegistryStore({ stateFilePath: path.join(dir, 'registry.json') });
+  const vault = new CredentialVault();
+  const secret = 'bot-flow-test-secret-1234567890';
+  const userAsync = '711111111111111111';
+  const userPublicFail = '722222222222222222';
+  const userEphemeralFail = '733333333333333333';
+  const userProvFail = '744444444444444444';
+
+  let simulateFailureNext = false;
+  const vmAdapter = createBotTestVmAdapter({
+    delayMs: 60,
+    shouldFail: () => (simulateFailureNext ? 'Guest OS password sync failed (chpasswd exit 1)' : null),
+  });
+
+  const app = express();
+  app.use(express.json());
+  app.use(
+    '/api/v1',
+    createManagementRouter({
+      store,
+      vmAdapter,
+      vault,
+      getSecret: () => secret,
+    })
+  );
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+
+  try {
+    const botMod = await import('../../discord-bot-export/index.js');
+    const ctx = botMod.createBotContext({
+      apiBaseUrl: `http://127.0.0.1:${port}`,
+      botSecret: secret,
+      pollIntervalMs: 25,
+      maxProvisionWaitMs: 3000,
+    });
+
+    // 1. Async Windows 7 provisioning polls cleanly until Ready, then sends public + ephemeral
+    const asyncWin7 = createMockInteraction({
+      commandName: 'create-vps',
+      userId: userAsync,
+      username: 'win7_owner',
+      displayName: 'Win7 Owner',
+      strings: { os: 'windows-7' },
+      forbiddenSecret: secret,
+    });
+    await ctx.handleInteraction(asyncWin7.interaction);
+    assert.equal(asyncWin7.publicMessages.length, 1);
+    assert.equal(asyncWin7.getLastEmbedJson().title, 'Your Moon Studio VPS Credentials');
+    assert.ok(JSON.stringify(asyncWin7.getLastPublicEmbedJson()).includes('Windows 7'));
+
+    // 2. Public channel send error does NOT block private Ephemeral credentials
+    const chFailMock = createMockInteraction({
+      commandName: 'create-vps',
+      userId: userPublicFail,
+      strings: { os: 'debian-12' },
+      failChannelSend: true,
+      forbiddenSecret: secret,
+    });
+    await ctx.handleInteraction(chFailMock.interaction);
+    assert.equal(chFailMock.publicMessages.length, 0);
+    assert.equal(chFailMock.getLastEmbedJson().title, 'Your Moon Studio VPS Credentials');
+
+    // 3. Ephemeral editReply failure NEVER sends credentials to channel.send and allows single Ephemeral /get-vps-credentials recovery
+    const ephemFailMock = createMockInteraction({
+      commandName: 'create-vps',
+      userId: userEphemeralFail,
+      username: 'recover_user',
+      strings: { os: 'windows-7' },
+      failEphemeralEditReply: true,
+      forbiddenSecret: secret,
+    });
+    await ctx.handleInteraction(ephemFailMock.interaction);
+    // Only credential-free public announcement was sent to channel.send; ZERO Ephemeral capture succeeded
+    assert.equal(ephemFailMock.publicMessages.length, 1);
+    assert.equal(ephemFailMock.captured.length, 0);
+
+    const ownerVpsList = store.listVps({ discordUserId: userEphemeralFail });
+    assert.equal(ownerVpsList.length, 1);
+    const failedDeliveryVpsId = ownerVpsList[0].vps_id;
+    assert.equal(vault.hasActiveEntry(failedDeliveryVpsId), true, 'Vault retains encrypted payload until Ephemeral delivery succeeds');
+
+    // Unauthorized user trying /get-vps-credentials -> 403 Permission Denied
+    const thiefMock = createMockInteraction({
+      commandName: 'get-vps-credentials',
+      userId: userAsync,
+      strings: { vps_id: failedDeliveryVpsId },
+    });
+    await ctx.handleInteraction(thiefMock.interaction);
+    assert.equal(thiefMock.getLastEmbedJson().title, 'Permission Denied');
+    assert.equal(vault.hasActiveEntry(failedDeliveryVpsId), true);
+
+    // Legitimate owner runs /get-vps-credentials -> receives private Ephemeral credentials & vault purges
+    const recoverMock = createMockInteraction({
+      commandName: 'get-vps-credentials',
+      userId: userEphemeralFail,
+      strings: { vps_id: failedDeliveryVpsId },
+      forbiddenSecret: secret,
+    });
+    await ctx.handleInteraction(recoverMock.interaction);
+    assert.equal(recoverMock.publicMessages.length, 0);
+    assert.equal(recoverMock.getLastEmbedJson().title, 'Your Moon Studio VPS Credentials');
+    const recoveredFields = recoverMock.getLastEmbedJson().fields as Array<{ name: string; value: string }>;
+    const recoveredPass = recoveredFields.find((f) => f.name === 'Password')?.value.replace(/`/g, '').trim();
+    assert.equal(recoveredPass, vmAdapter.getGeneratedPassword(failedDeliveryVpsId));
+    assert.equal(vault.hasActiveEntry(failedDeliveryVpsId), false, 'Vault must purge after Ephemeral recovery');
+
+    // Second recovery attempt rejected
+    const repeatRecoverMock = createMockInteraction({
+      commandName: 'get-vps-credentials',
+      userId: userEphemeralFail,
+      strings: { vps_id: failedDeliveryVpsId },
+    });
+    await ctx.handleInteraction(repeatRecoverMock.interaction);
+    assert.notEqual(repeatRecoverMock.getLastEmbedJson().title, 'Your Moon Studio VPS Credentials');
+
+    // 4. Provisioning failure sends ZERO public announcements and ZERO credentials
+    simulateFailureNext = true;
+    const provFailMock = createMockInteraction({
+      commandName: 'create-vps',
+      userId: userProvFail,
+      strings: { os: 'debian-12' },
+    });
+    await ctx.handleInteraction(provFailMock.interaction);
+    assert.equal(provFailMock.publicMessages.length, 0, 'Must NOT send public announcement when provisioning fails');
+    assert.equal(provFailMock.getLastEmbedJson().title, 'VPS Provisioning Failed');
+    assert.ok(JSON.stringify(provFailMock.getLastEmbedJson()).includes('Guest OS password sync failed'));
+
+    // 5. RdpServiceManager rejects invalid username / empty password in strict mode without modifying OS
+    const rdp = new RdpServiceManager();
+    await assert.rejects(
+      () => rdp.ensureRdpServerRunning('bad user!', 'Secret123!', { strictPasswordSync: true }),
+      /Invalid OS username format/
+    );
+    await assert.rejects(
+      () => rdp.ensureRdpServerRunning('Administrator', '', { strictPasswordSync: true }),
+      /empty password/
+    );
+  } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -12,9 +12,25 @@ export class RdpServiceManager {
   /**
    * Initializes and starts the real RDP server listening on port 3389
    */
-  public async ensureRdpServerRunning(username: string, password: string): Promise<boolean> {
+  public async ensureRdpServerRunning(
+    username: string,
+    password: string,
+    options?: { strictPasswordSync?: boolean; skipPasswordReset?: boolean }
+  ): Promise<boolean> {
+    const strict = Boolean(options?.strictPasswordSync);
+    const skipPasswordReset = Boolean(options?.skipPasswordReset);
+    if (!/^[a-zA-Z0-9._-]{1,32}$/.test(username)) {
+      throw new Error(`Invalid OS username format: ${username}`);
+    }
+    if (!skipPasswordReset && !password) {
+      throw new Error('Cannot configure guest RDP account with empty password.');
+    }
+
     this.currentUsername = username;
-    this.currentPassword = password;
+    if (!skipPasswordReset) {
+      this.currentPassword = password;
+      serverLogger.registerSecret(password);
+    }
 
     serverLogger.info('RDPService', `Configuring Remote Desktop Services for user ${username}...`);
 
@@ -53,25 +69,33 @@ export class RdpServiceManager {
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         serverLogger.warn('RDPService', `User creation notice: ${msg}`);
+        if (strict) {
+          throw new Error(`Failed to create OS user ${username}: ${msg}`);
+        }
       }
     }
 
     // 2. Set password securely via chpasswd stdin without logging
-    try {
-      const proc = spawn('chpasswd');
-      proc.stdin.write(`${username}:${password}\n`);
-      proc.stdin.end();
-      await new Promise<void>((resolve, reject) => {
-        proc.on('close', (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`chpasswd exited with code ${code}`));
+    if (!skipPasswordReset) {
+      try {
+        const proc = spawn('chpasswd');
+        proc.stdin.write(`${username}:${password}\n`);
+        proc.stdin.end();
+        await new Promise<void>((resolve, reject) => {
+          proc.on('close', (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`chpasswd exited with code ${code}`));
+          });
+          proc.on('error', reject);
         });
-        proc.on('error', reject);
-      });
-      serverLogger.info('RDPService', `Credentials synchronized for account ${username}`);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      serverLogger.error('RDPService', `Failed to synchronize password: ${msg}`);
+        serverLogger.info('RDPService', `Credentials synchronized for account ${username}`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        serverLogger.error('RDPService', `Failed to synchronize password: ${msg}`);
+        if (strict) {
+          throw new Error(`Credential configuration failed inside Debian 12 guest for ${username}: ${msg}`);
+        }
+      }
     }
 
     // 2.5 Ensure system D-Bus daemon is running (critical for desktop session not crashing)

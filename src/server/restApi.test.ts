@@ -8,16 +8,37 @@ import path from 'node:path';
 import { createManagementRouter, VmLifecycleAdapter } from './managementApi';
 import { RegistryStore } from './registryStore';
 import { AUTHORIZED_ADMIN_ID, computeRequestSignature } from './botAuth';
-import { getDefaultProvisioningPassword } from './credentialPolicy';
+import { CredentialVault, getDefaultProvisioningPassword, verifyPasswordScrypt } from './credentialPolicy';
+import { generateWindowsPassword } from '../utils/credentials';
 import { VmRecord } from './vmManager';
 
-function createMockVmAdapter(): VmLifecycleAdapter {
+function createMockVmAdapter(behavior?: {
+  initialStatus?: 'Ready' | 'Booting' | 'Failed';
+  failMessage?: string;
+}): VmLifecycleAdapter & {
+  simulateReady: (id: string) => void;
+  simulateFail: (id: string, reason: string) => void;
+} {
   const vms = new Map<string, VmRecord>();
+  const hooks = new Map<
+    string,
+    {
+      password: string;
+      onProvisioned?: (vm: VmRecord, actualPassword: string) => void;
+      onProvisionFailed?: (vm: VmRecord, reason: string) => void;
+    }
+  >();
   let seq = 1;
 
   return {
     async createVm(options) {
       const id = options.id || `vm-${options.osId}-test${seq++}`;
+      const actualPassword = options.generateUniqueCredentials
+        ? generateWindowsPassword(16)
+        : getDefaultProvisioningPassword();
+      const targetStatus = behavior?.initialStatus || 'Ready';
+      const completedAt = new Date().toISOString();
+
       const record: VmRecord = {
         id,
         name: options.name || `VM ${id}`,
@@ -29,7 +50,7 @@ function createMockVmAdapter(): VmLifecycleAdapter {
         memoryMb: options.memoryMb || 2048,
         diskGb: options.diskGb || 40,
         username: 'Administrator',
-        password: '[POLICY_MANAGED]',
+        password: '[VAULT_PROTECTED]',
         localPort: 3390 + seq,
         ipAddress: '159.223.110.159',
         publicEndpoint: `159.223.110.159:${3390 + seq}`,
@@ -40,13 +61,50 @@ function createMockVmAdapter(): VmLifecycleAdapter {
           guestPort: 3389,
           natForwarding: true,
         },
-        status: 'Ready',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
+        status: targetStatus,
+        createdAt: completedAt,
+        updatedAt: completedAt,
         isPolicyManaged: true,
+        isApiManaged: true,
+        credentialsConfigured: targetStatus === 'Ready',
+        credentialsConfiguredAt: targetStatus === 'Ready' ? completedAt : undefined,
+        provisioningCompletedAt: targetStatus === 'Ready' ? completedAt : undefined,
+        failureReason: targetStatus === 'Failed' ? behavior?.failMessage || 'Simulated guest failure' : undefined,
       };
       vms.set(id, record);
+      hooks.set(id, {
+        password: actualPassword,
+        onProvisioned: options.onProvisioned,
+        onProvisionFailed: options.onProvisionFailed,
+      });
+
+      if (targetStatus === 'Ready') {
+        options.onProvisioned?.(record, actualPassword);
+      } else if (targetStatus === 'Failed') {
+        options.onProvisionFailed?.(record, record.failureReason || 'Simulated guest failure');
+      }
       return record;
+    },
+    simulateReady(id: string) {
+      const vm = vms.get(id);
+      const hook = hooks.get(id);
+      if (!vm || !hook) return;
+      const completedAt = new Date().toISOString();
+      vm.status = 'Ready';
+      vm.credentialsConfigured = true;
+      vm.credentialsConfiguredAt = completedAt;
+      vm.provisioningCompletedAt = completedAt;
+      vm.updatedAt = completedAt;
+      hook.onProvisioned?.(vm, hook.password);
+    },
+    simulateFail(id: string, reason: string) {
+      const vm = vms.get(id);
+      const hook = hooks.get(id);
+      if (!vm || !hook) return;
+      vm.status = 'Failed';
+      vm.credentialsConfigured = false;
+      vm.failureReason = reason;
+      hook.onProvisionFailed?.(vm, reason);
     },
     getVm(id) {
       return vms.get(id);
@@ -113,13 +171,19 @@ function createMockVmAdapter(): VmLifecycleAdapter {
   };
 }
 
-async function setupTestServer() {
+async function setupTestServer(adapterBehavior?: {
+  initialStatus?: 'Ready' | 'Booting' | 'Failed';
+  failMessage?: string;
+}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moon-api-test-'));
   let nowMs = 1_700_000_000_000;
+  const registryPath = path.join(dir, 'registry.json');
   const store = new RegistryStore({
-    stateFilePath: path.join(dir, 'registry.json'),
+    stateFilePath: registryPath,
     nowProvider: () => nowMs,
   });
+  const vault = new CredentialVault();
+  const vmAdapter = createMockVmAdapter(adapterBehavior);
   const secret = 'test-super-secret-bot-key-1234567890';
   const adminId = '999999999999999999';
   process.env.DISCORD_ADMIN_IDS = adminId;
@@ -131,7 +195,8 @@ async function setupTestServer() {
     '/api/v1',
     createManagementRouter({
       store,
-      vmAdapter: createMockVmAdapter(),
+      vmAdapter,
+      vault,
       getSecret: () => secret,
     })
   );
@@ -185,6 +250,9 @@ async function setupTestServer() {
     secret,
     adminId,
     store,
+    vault,
+    vmAdapter,
+    registryPath,
     advanceSeconds(sec: number) {
       nowMs += sec * 1000;
     },
@@ -413,6 +481,134 @@ test('REST API Admin Test Mode restricts toggle to 1390253651574132828 and isola
       machine_id: 'test-mode-node-2',
     });
     assert.equal(blockedAfterOff.status, 429);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('REST API protects VPS credentials: blocks unauthorized/unready/duplicate reads and supports controlled recovery', async () => {
+  const srv = await setupTestServer({ initialStatus: 'Booting' });
+  const ownerId = '111111111111111111';
+  const otherUserId = '222222222222222222';
+
+  try {
+    // 1. Provisioning starts in Booting state (not Ready yet)
+    const createRes = await srv.signedFetch('POST', '/api/v1/vps', ownerId, {
+      os_id: 'debian-12',
+      name: 'Async-Cred-VPS',
+      idempotency_key: 'idem-create-1',
+    });
+    assert.equal(createRes.status, 201);
+    const vpsId = String((createRes.json?.vps as Record<string, unknown>).vps_id);
+    assert.equal((createRes.json?.vps as Record<string, unknown>).credentials_ready, false);
+
+    // 2. Unauthenticated credential retrieval -> 401
+    const unauthCred = await fetch(`${srv.baseUrl}/api/v1/vps/${vpsId}/credentials`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'initial' }),
+    });
+    assert.equal(unauthCred.status, 401);
+
+    // 3. Before Ready -> 409 VPS_NOT_READY
+    const notReadyRes = await srv.signedFetch('POST', `/api/v1/vps/${vpsId}/credentials`, ownerId, {
+      mode: 'initial',
+    });
+    assert.equal(notReadyRes.status, 409);
+    assert.equal(notReadyRes.json?.code, 'VPS_NOT_READY');
+
+    // 4. Simulate guest provisioning & credential configuration completion
+    srv.vmAdapter.simulateReady(vpsId);
+    // Allow microtask/async store update to settle
+    await new Promise((r) => setTimeout(r, 30));
+
+    // 5. Public GET /vps/:vpsId confirms ready WITHOUT password
+    const infoRes = await srv.signedFetch('GET', `/api/v1/vps/${vpsId}`, ownerId);
+    assert.equal(infoRes.status, 200);
+    const infoVps = infoRes.json?.vps as Record<string, unknown>;
+    assert.equal(infoVps.credentials_ready, true);
+    assert.equal('password' in infoVps, false);
+
+    // 6. Another user and regular admin CANNOT retrieve owner's credentials -> 403 FORBIDDEN
+    const otherRes = await srv.signedFetch('POST', `/api/v1/vps/${vpsId}/credentials`, otherUserId, {
+      mode: 'initial',
+    });
+    assert.equal(otherRes.status, 403);
+
+    const otherAdminRes = await srv.signedFetch('POST', `/api/v1/vps/${vpsId}/credentials`, srv.adminId, {
+      mode: 'initial',
+    });
+    assert.equal(otherAdminRes.status, 403);
+
+    // 7. Owner retrieves initial credentials -> 200, Cache-Control: no-store, real password matching scrypt hash
+    const credRes = await srv.signedFetch('POST', `/api/v1/vps/${vpsId}/credentials`, ownerId, {
+      mode: 'initial',
+    });
+    assert.equal(credRes.status, 200);
+    assert.equal(credRes.headers.get('cache-control'), 'no-store');
+    const creds = credRes.json?.credentials as Record<string, string>;
+    assert.equal(creds.vps_id, vpsId);
+    assert.equal(creds.os_name, 'Debian 12');
+    assert.ok(creds.public_ip);
+    assert.ok(creds.username);
+    assert.ok(creds.password && creds.password !== '[POLICY_MANAGED]' && creds.password !== '[VAULT_PROTECTED]');
+    assert.ok(creds.password.length >= 16);
+
+    const persistedRaw = fs.readFileSync(srv.registryPath, 'utf8');
+    assert.equal(persistedRaw.includes(creds.password), false, 'Registry file must never store plaintext password');
+    const persistedJson = JSON.parse(persistedRaw) as { vpsList?: Array<{ vps_id: string; password_hash: string }> };
+    const storedRecord = persistedJson.vpsList?.find((v) => v.vps_id === vpsId);
+    assert.ok(storedRecord?.password_hash);
+    assert.equal(verifyPasswordScrypt(creds.password, storedRecord.password_hash), true);
+
+    // 8. Duplicate initial retrieval -> 409 CREDENTIAL_ALREADY_DELIVERED
+    const dupCredRes = await srv.signedFetch('POST', `/api/v1/vps/${vpsId}/credentials`, ownerId, {
+      mode: 'initial',
+    });
+    assert.equal(dupCredRes.status, 409);
+    assert.equal(dupCredRes.json?.code, 'CREDENTIAL_ALREADY_DELIVERED');
+
+    // 9. Mark ephemeral_failed -> allows ONE recovery retrieval, then purges vault
+    const markFailRes = await srv.signedFetch('POST', `/api/v1/vps/${vpsId}/delivery-status`, ownerId, {
+      ephemeral_failed: true,
+    });
+    assert.equal(markFailRes.status, 200);
+
+    const recoverRes = await srv.signedFetch('POST', `/api/v1/vps/${vpsId}/credentials`, ownerId, {
+      mode: 'recovery',
+    });
+    assert.equal(recoverRes.status, 200);
+    assert.equal((recoverRes.json?.credentials as Record<string, string>).password, creds.password);
+
+    // Second recovery rejected after purge
+    const secondRecoverRes = await srv.signedFetch('POST', `/api/v1/vps/${vpsId}/credentials`, ownerId, {
+      mode: 'recovery',
+    });
+    assert.equal(secondRecoverRes.status, 404);
+    assert.equal(srv.vault.hasActiveEntry(vpsId), false);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('REST API blocks credential retrieval on failed provisioning (422 PROVISIONING_FAILED)', async () => {
+  const srv = await setupTestServer({ initialStatus: 'Failed', failMessage: 'chpasswd exited with code 1' });
+  const ownerId = '111111111111111111';
+
+  try {
+    const createRes = await srv.signedFetch('POST', '/api/v1/vps', ownerId, {
+      os_id: 'debian-12',
+      name: 'Failing-VPS',
+    });
+    assert.equal(createRes.status, 201);
+    const vpsId = String((createRes.json?.vps as Record<string, unknown>).vps_id);
+
+    const credRes = await srv.signedFetch('POST', `/api/v1/vps/${vpsId}/credentials`, ownerId, {
+      mode: 'initial',
+    });
+    assert.equal(credRes.status, 422);
+    assert.equal(credRes.json?.code, 'PROVISIONING_FAILED');
+    assert.equal(srv.vault.hasActiveEntry(vpsId), false);
   } finally {
     await srv.close();
   }

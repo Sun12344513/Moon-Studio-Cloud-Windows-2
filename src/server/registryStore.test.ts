@@ -12,9 +12,12 @@ import { AUTHORIZED_ADMIN_ID } from './botAuth';
 import {
   createDefaultPasswordHash,
   getDefaultProvisioningPassword,
+  hashPasswordScrypt,
   verifyPasswordScrypt,
   verifyAgainstDefaultPassword,
   sanitizePublicRecord,
+  CredentialVault,
+  CredentialVaultError,
 } from './credentialPolicy';
 
 function createTempStore(initialNowMs = 1_700_000_000_000) {
@@ -294,6 +297,181 @@ test('Admin Test Mode authorizes only 1390253651574132828, isolates cooldown byp
         }),
       (err: unknown) => err instanceof RegistryError && err.statusCode === 429 && (err.retryAfter || 0) > 590
     );
+  } finally {
+    ctx.cleanup();
+  }
+});
+
+test('CredentialVault encrypts at rest in RAM, enforces owner isolation, TTL, one-time recovery, and purge', () => {
+  let now = 1_700_000_000_000;
+  const vault = new CredentialVault({ nowProvider: () => now });
+  const ownerId = '111111111111111111';
+  const otherId = '222222222222222222';
+  const actualPassword = 'R9#kL!xQ2vP8@wN4';
+
+  vault.store(
+    ownerId,
+    {
+      vps_id: 'vm-vault-1',
+      os_id: 'debian-12',
+      os_name: 'Debian 12',
+      public_ip: '159.223.110.159',
+      public_endpoint: '159.223.110.159:3390',
+      username: 'Administrator',
+      password: actualPassword,
+      created_at: new Date(now).toISOString(),
+    },
+    60_000
+  );
+
+  assert.equal(vault.hasActiveEntry('vm-vault-1'), true);
+
+  // Another user cannot retrieve
+  assert.throws(
+    () =>
+      vault.retrieve({
+        vpsId: 'vm-vault-1',
+        actorDiscordUserId: otherId,
+        isAuthorizedAdmin: false,
+        mode: 'initial',
+      }),
+    (err: unknown) => err instanceof CredentialVaultError && err.statusCode === 403
+  );
+
+  // Owner retrieves initial once
+  const first = vault.retrieve({
+    vpsId: 'vm-vault-1',
+    actorDiscordUserId: ownerId,
+    isAuthorizedAdmin: false,
+    mode: 'initial',
+  });
+  assert.equal(first.password, actualPassword);
+
+  // Duplicate initial rejected (409)
+  assert.throws(
+    () =>
+      vault.retrieve({
+        vpsId: 'vm-vault-1',
+        actorDiscordUserId: ownerId,
+        isAuthorizedAdmin: false,
+        mode: 'initial',
+      }),
+    (err: unknown) => err instanceof CredentialVaultError && err.statusCode === 409
+  );
+
+  // Recovery rejected if Ephemeral failure not marked
+  assert.throws(
+    () =>
+      vault.retrieve({
+        vpsId: 'vm-vault-1',
+        actorDiscordUserId: ownerId,
+        isAuthorizedAdmin: false,
+        mode: 'recovery',
+      }),
+    (err: unknown) => err instanceof CredentialVaultError && err.statusCode === 409
+  );
+
+  // Mark recovery allowed -> single recovery works and purges entry
+  vault.markRecoveryAllowed('vm-vault-1');
+  const recovered = vault.retrieve({
+    vpsId: 'vm-vault-1',
+    actorDiscordUserId: ownerId,
+    isAuthorizedAdmin: false,
+    mode: 'recovery',
+  });
+  assert.equal(recovered.password, actualPassword);
+  assert.equal(vault.hasActiveEntry('vm-vault-1'), false);
+
+  // After purge, retrieval throws 404
+  assert.throws(
+    () =>
+      vault.retrieve({
+        vpsId: 'vm-vault-1',
+        actorDiscordUserId: ownerId,
+        isAuthorizedAdmin: false,
+        mode: 'recovery',
+      }),
+    (err: unknown) => err instanceof CredentialVaultError && err.statusCode === 404
+  );
+
+  // TTL expiration test
+  vault.store(
+    ownerId,
+    {
+      vps_id: 'vm-vault-ttl',
+      os_id: 'windows-7',
+      os_name: 'Windows 7',
+      public_ip: '159.223.110.159',
+      public_endpoint: '159.223.110.159:3391',
+      username: 'Administrator',
+      password: actualPassword,
+      created_at: new Date(now).toISOString(),
+    },
+    10_000
+  );
+  now += 10_001;
+  assert.throws(
+    () =>
+      vault.retrieve({
+        vpsId: 'vm-vault-ttl',
+        actorDiscordUserId: ownerId,
+        isAuthorizedAdmin: false,
+        mode: 'initial',
+      }),
+    (err: unknown) => err instanceof CredentialVaultError && err.statusCode === 410
+  );
+});
+
+test('RegistryStore handles idempotency_key cleanly and never persists plaintext passwords', async () => {
+  const ctx = createTempStore();
+  try {
+    const userA = '666666666666666666';
+    const generatedPass = 'S7$vK9!mQ2zP4@xR';
+    let calls = 0;
+
+    const first = await ctx.store.createVpsSubmission({
+      discordUserId: userA,
+      discordUsername: 'IdempotentUser',
+      osId: 'debian-12',
+      idempotencyKey: 'interaction-id-999',
+      provisionVm: async () => {
+        calls += 1;
+        return {
+          vmId: 'vm-idempotent-1',
+          status: 'Ready',
+          credentialsReady: true,
+          completedAt: '2026-11-15T16:08:45.000Z',
+        };
+      },
+    });
+    assert.equal(first.idempotentReplay, false);
+    assert.equal(calls, 1);
+
+    await ctx.store.markVpsProvisioningState('vm-idempotent-1', {
+      status: 'Ready',
+      credentialsReady: true,
+      completedAt: '2026-11-15T16:08:45.000Z',
+      passwordHash: hashPasswordScrypt(generatedPass),
+    });
+
+    // Retry with same idempotency_key does not consume cooldown or re-provision
+    const replay = await ctx.store.createVpsSubmission({
+      discordUserId: userA,
+      discordUsername: 'IdempotentUser',
+      osId: 'debian-12',
+      idempotencyKey: 'interaction-id-999',
+      provisionVm: async () => {
+        calls += 1;
+        return { vmId: 'vm-should-not-run', status: 'Queued' };
+      },
+    });
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.vps.vps_id, 'vm-idempotent-1');
+    assert.equal(calls, 1);
+
+    const diskContent = fs.readFileSync(ctx.filePath, 'utf8');
+    assert.equal(diskContent.includes(generatedPass), false, 'Registry state on disk must never contain plaintext password');
+    assert.equal(diskContent.includes('happy106725@'), false);
   } finally {
     ctx.cleanup();
   }
