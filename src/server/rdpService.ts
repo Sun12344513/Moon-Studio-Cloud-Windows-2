@@ -8,11 +8,52 @@ export class RdpServiceManager {
   private isRunning = false;
   private currentUsername = 'Administrator';
   private currentPassword = '';
+  private setupMutex: Promise<void> = Promise.resolve();
+
+  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.setupMutex.then(fn, fn);
+    this.setupMutex = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  private async runShellAsync(command: string, timeoutMs = 180000): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn('/bin/sh', ['-c', command], { stdio: 'pipe' });
+      let stderr = '';
+      child.stderr?.on('data', (d) => {
+        stderr += d.toString();
+      });
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`Command timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0) resolve();
+        else reject(new Error(stderr.trim() || `Shell exited with code ${code}`));
+      });
+    });
+  }
 
   /**
    * Initializes and starts the real RDP server listening on port 3389
    */
-  public async ensureRdpServerRunning(
+  public ensureRdpServerRunning(
+    username: string,
+    password: string,
+    options?: { strictPasswordSync?: boolean; skipPasswordReset?: boolean }
+  ): Promise<boolean> {
+    return this.runExclusive(() => this.ensureRdpServerRunningInternal(username, password, options));
+  }
+
+  private async ensureRdpServerRunningInternal(
     username: string,
     password: string,
     options?: { strictPasswordSync?: boolean; skipPasswordReset?: boolean }
@@ -34,18 +75,27 @@ export class RdpServiceManager {
 
     serverLogger.info('RDPService', `Configuring Remote Desktop Services for user ${username}...`);
 
-    // 0. Ensure xrdp and desktop packages are installed
+    // 0. Ensure xrdp and desktop packages are installed (async, non-blocking)
     if (!fs.existsSync('/usr/sbin/xrdp') || !fs.existsSync('/usr/bin/startxfce4') || !fs.existsSync('/usr/bin/dbus-daemon')) {
-      serverLogger.info('RDPService', 'xrdp or desktop packages missing. Auto-installing in background...');
+      serverLogger.info('RDPService', 'xrdp or desktop packages missing. Installing required packages...');
       try {
-        execSync(
-          'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" --no-install-recommends xrdp xorgxrdp xfce4-session xfwm4 xfce4-panel xfdesktop4 thunar chromium falkon dbus dbus-x11 ssl-cert xfce4-terminal desktop-base genisoimage nasm',
-          { stdio: 'pipe' }
+        await this.runShellAsync(
+          'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" --no-install-recommends xrdp xorgxrdp xfce4-session xfwm4 xfce4-panel xfdesktop4 thunar chromium falkon dbus dbus-x11 ssl-cert xfce4-terminal desktop-base genisoimage nasm'
         );
         serverLogger.info('RDPService', 'xrdp, D-Bus and XFCE4 packages installed successfully.');
       } catch (installErr) {
         serverLogger.warn('RDPService', `Auto-install notice: ${installErr}`);
+        if (strict && !fs.existsSync('/usr/sbin/xrdp')) {
+          throw new Error(`XRDP package installation failed: ${installErr}`);
+        }
       }
+    }
+
+    if (!fs.existsSync('/usr/sbin/xrdp') || !fs.existsSync('/usr/sbin/xrdp-sesman')) {
+      if (strict) {
+        throw new Error('XRDP binaries (/usr/sbin/xrdp, /usr/sbin/xrdp-sesman) are not available on host.');
+      }
+      return false;
     }
 
     // Ensure ssl certificate exists and xrdp has read permissions
@@ -255,13 +305,40 @@ export class RdpServiceManager {
       }
     }
 
-    // 6. Test RDP port and protocol
-    const check = await this.verifyRdpLocal();
-    return check.connected;
+    // 7. Test RDP port and real X.224 Connection Confirm (0xD0) with bounded retry
+    const check = await this.verifyRdpOnPort(3389, { timeoutMs: 2500, retries: 6, retryDelayMs: 500 });
+    return check.connected && check.rdpNegotiated;
   }
 
   public async verifyRdpLocal(): Promise<RdpHealthResult> {
     return rdpHealthChecker.checkRdp('127.0.0.1', 3389, 3000);
+  }
+
+  public async verifyRdpOnPort(
+    port = 3389,
+    options?: { timeoutMs?: number; retries?: number; retryDelayMs?: number }
+  ): Promise<RdpHealthResult> {
+    const timeoutMs = options?.timeoutMs ?? 2500;
+    const retries = Math.max(1, options?.retries ?? 4);
+    const retryDelayMs = options?.retryDelayMs ?? 400;
+
+    let lastResult: RdpHealthResult = {
+      connected: false,
+      latencyMs: 0,
+      rdpNegotiated: false,
+      statusMessage: 'RDP readiness probe has not run.',
+    };
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      lastResult = await rdpHealthChecker.checkRdp('127.0.0.1', port, timeoutMs);
+      if (lastResult.connected && lastResult.rdpNegotiated) {
+        return lastResult;
+      }
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+      }
+    }
+    return lastResult;
   }
 
   public async verifyAuthentication(): Promise<{ success: boolean; message: string }> {

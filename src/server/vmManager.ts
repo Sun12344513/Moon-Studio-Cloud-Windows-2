@@ -108,6 +108,9 @@ export class VmManager {
               item.osId = 'debian-12';
             }
             this.vms.set(item.id, item);
+            if (typeof item.localPort === 'number' && item.localPort > 0) {
+              networkManager.reservePort(item.localPort, item.id);
+            }
             serverLogger.registerSecret(item.password);
           }
         }
@@ -193,9 +196,12 @@ export class VmManager {
     const cores = options.cores || osDef.recommendedCores;
     const memoryMb = options.memoryMb || osDef.recommendedRamMb;
     const diskGb = options.diskGb || osDef.minDiskGb;
-    const username = options.username || osDef.defaultUsername;
     const isApiManaged = Boolean(options.generateUniqueCredentials);
     const isPolicyManaged = Boolean(options.useDefaultCredentialPolicy) && !isApiManaged;
+    const defaultUsername = (isApiManaged && options.osId === 'debian-12')
+      ? `moon_${vmId.replace(/[^a-z0-9]/gi, '').slice(-8).toLowerCase()}`
+      : osDef.defaultUsername;
+    const username = options.username || defaultUsername;
 
     const actualPassword = isPolicyManaged
       ? getDefaultProvisioningPassword()
@@ -242,7 +248,7 @@ export class VmManager {
       password: storedRecordPassword,
       localPort,
       ipAddress: realIp,
-      publicEndpoint: `${realIp}:${localPort}`,
+      publicEndpoint: 'Pending',
       hypervisorId: 'qemu-tcg-x86_64',
       networkConfig: {
         interfaceType: isWin7 ? 'Intel e1000' : 'VirtIO-net',
@@ -362,9 +368,12 @@ export class VmManager {
       }
 
       if (vm.osId === 'debian-12') {
-        await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd, {
+        const rdpReady = await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd, {
           strictPasswordSync: Boolean(vm.isApiManaged),
         });
+        if (!rdpReady) {
+          throw new Error('Debian 12 Remote Desktop service (xrdp) failed local X.224 readiness check on port 3389.');
+        }
       } else if (vm.osId === 'windows-7') {
         this.prepareWindowsGuestCredentialsPayload(vm, effectivePwd);
       }
@@ -384,15 +393,53 @@ export class VmManager {
         throw new Error(`Hypervisor process failed to enter RUNNING state for ${vm.osId}.`);
       }
 
+      if (vm.osId === 'debian-12') {
+        const localBridgeCheck = await rdpServiceManager.verifyRdpOnPort(vm.localPort, {
+          timeoutMs: 2500,
+          retries: 5,
+          retryDelayMs: 400,
+        });
+        if (!localBridgeCheck.connected || !localBridgeCheck.rdpNegotiated) {
+          throw new Error(
+            `Local RDP endpoint 127.0.0.1:${vm.localPort} failed X.224 handshake check: ${localBridgeCheck.statusMessage}`
+          );
+        }
+      }
+
       // 5. Running & Public Network Synchronization with dedicated distinct port
       const isWin7 = vm.osId === 'windows-7';
       const tunnel = await tunnelManager.startTunnelForVm(vm.id, vm.localPort, {
         preferNewPort: isWin7 || vm.id !== this.primaryVmId,
       });
 
-      const assignedPort = tunnel.publicPort || vm.localPort;
-      const assignedHost = tunnel.publicHost || '159.223.110.159';
+      if (!tunnel.publicPort || !tunnel.publicHost) {
+        throw new Error('Public TCP relay tunnel failed to allocate an external IP:Port endpoint.');
+      }
+
+      const assignedPort = tunnel.publicPort;
+      const assignedHost = tunnel.publicHost;
       const endpoint = `${assignedHost}:${assignedPort}`;
+
+      if (vm.osId === 'debian-12') {
+        let verified = false;
+        for (let attempt = 1; attempt <= 4; attempt++) {
+          verified = await tunnelManager.verifyExternalEndpoint(vm.id);
+          if (verified) break;
+          if (attempt < 4) {
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+        }
+        const verifiedStatus = tunnelManager.getStatus(vm.id);
+        vm.rdpHealth = verifiedStatus.rdpVerification;
+        if (!verified || !verifiedStatus.rdpVerification?.rdpNegotiated) {
+          throw new Error(
+            `Public RDP endpoint ${endpoint} failed end-to-end X.224 handshake verification: ${
+              verifiedStatus.rdpVerification?.statusMessage || 'unverified'
+            }`
+          );
+        }
+      }
+
       const completedAt = new Date().toISOString();
 
       vm.credentialsConfigured = true;
@@ -405,7 +452,7 @@ export class VmManager {
       vm.statusMessage = isWin7
         ? `Máy ảo Windows 7 SP1 đã khởi chạy thành công trên QEMU với cổng riêng biệt mới: ${endpoint}.`
         : 'Máy chủ đang hoạt động bình thường trên hạ tầng Google Cloud.';
-      vm.isExternalVerified = true;
+      vm.isExternalVerified = vm.osId === 'debian-12' ? true : Boolean(tunnel.isVerified);
       vm.updatedAt = completedAt;
 
       // Deliver credentials into encrypted server vault BEFORE clearing ephemeral memory password
@@ -419,7 +466,7 @@ export class VmManager {
       this.provisioningCallbacks.delete(vmId);
 
       this.saveState();
-      serverLogger.info('Provisioner', `[Stage 5/5] VM online with configured credentials and endpoint: ${endpoint}`, vmId);
+      serverLogger.info('Provisioner', `[Stage 5/5] VM online with verified credentials and endpoint: ${endpoint}`, vmId);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       vm.status = 'Failed';
@@ -504,9 +551,17 @@ export class VmManager {
       });
 
       const isWin7 = vm.osId === 'windows-7';
-      await tunnelManager.startTunnelForVm(vm.id, vm.localPort, {
+      const tunnel = await tunnelManager.startTunnelForVm(vm.id, vm.localPort, {
         preferNewPort: isWin7 || vm.id !== this.primaryVmId,
       });
+
+      if (tunnel.publicPort && tunnel.publicHost) {
+        vm.ipAddress = tunnel.publicHost;
+        vm.publicEndpoint = `${tunnel.publicHost}:${tunnel.publicPort}`;
+      }
+      if (vm.osId === 'debian-12' && tunnel.publicPort) {
+        vm.isExternalVerified = await tunnelManager.verifyExternalEndpoint(vm.id);
+      }
 
       vm.status = 'Ready';
       vm.lastBootAt = new Date().toISOString();
@@ -576,11 +631,26 @@ export class VmManager {
         await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd, {
           skipPasswordReset: vm.isApiManaged && isProtected,
         });
+        await hypervisor.startVmProcess({
+          vmId: vm.id,
+          osId: vm.osId,
+          hostPort: vm.localPort,
+          memoryMb: vm.memoryMb,
+          cores: vm.cores,
+        });
       }
 
-      await tunnelManager.startTunnelForVm(vm.id, vm.localPort, {
+      const tunnel = await tunnelManager.startTunnelForVm(vm.id, vm.localPort, {
         preferNewPort: vm.osId === 'windows-7' || vm.id !== this.primaryVmId,
       });
+
+      if (tunnel.publicPort && tunnel.publicHost) {
+        vm.ipAddress = tunnel.publicHost;
+        vm.publicEndpoint = `${tunnel.publicHost}:${tunnel.publicPort}`;
+      }
+      if (vm.osId === 'debian-12' && tunnel.publicPort) {
+        vm.isExternalVerified = await tunnelManager.verifyExternalEndpoint(vm.id);
+      }
 
       vm.status = 'Ready';
       vm.statusMessage = 'Máy ảo đã khởi động lại thành công.';
@@ -687,12 +757,22 @@ export class VmManager {
     serverLogger.info('VMManager', `Reloading IP and public endpoint for VM ${vm.id} (${vm.osName})...`, vm.id);
     const oldEndpoint = vm.publicEndpoint;
 
-    // 1. Ensure local service listener is active
+    // 1. Ensure local service listener & native bridge are active
     if (vm.osId === 'debian-12') {
       const isProtected = vm.password === '[VAULT_PROTECTED]' || vm.password === '[POLICY_MANAGED]';
       const effectivePwd = vm.isPolicyManaged ? getDefaultProvisioningPassword() : vm.password;
-      await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd, {
+      const rdpReady = await rdpServiceManager.ensureRdpServerRunning(vm.username, effectivePwd, {
         skipPasswordReset: vm.isApiManaged && isProtected,
+      });
+      if (!rdpReady) {
+        throw new Error('Debian 12 xrdp service failed local X.224 readiness check during IP reload.');
+      }
+      await hypervisor.startVmProcess({
+        vmId: vm.id,
+        osId: vm.osId,
+        hostPort: vm.localPort,
+        memoryMb: vm.memoryMb,
+        cores: vm.cores,
       });
     } else if (vm.osId === 'windows-7') {
       const proc = hypervisor.getVmProcess(vm.id);
@@ -713,14 +793,25 @@ export class VmManager {
 
     // 2. Reload tunnel to request a clean new public endpoint
     const tunnel = await tunnelManager.reloadTunnel(vm.id, vm.localPort);
-    const assignedPort = tunnel.publicPort || vm.localPort;
-    const assignedHost = tunnel.publicHost || '159.223.110.159';
+    if (!tunnel.publicPort || !tunnel.publicHost) {
+      throw new Error('Failed to allocate a new public endpoint from TCP relay tunnel.');
+    }
+    const assignedPort = tunnel.publicPort;
+    const assignedHost = tunnel.publicHost;
     const newEndpoint = `${assignedHost}:${assignedPort}`;
+
+    let verified = Boolean(tunnel.isVerified);
+    if (vm.osId === 'debian-12') {
+      verified = await tunnelManager.verifyExternalEndpoint(vm.id);
+      if (!verified) {
+        throw new Error(`New public RDP endpoint ${newEndpoint} failed end-to-end X.224 handshake check.`);
+      }
+    }
 
     vm.ipAddress = assignedHost;
     vm.publicEndpoint = newEndpoint;
     vm.status = 'Ready';
-    vm.isExternalVerified = true;
+    vm.isExternalVerified = verified;
     vm.statusMessage = vm.osId === 'windows-7'
       ? `Đã cấp phát địa chỉ IP & Cổng mới cho Windows 7 SP1: ${newEndpoint}. Sẵn sàng kết nối!`
       : `Đã cấp phát địa chỉ IP & Cổng mới cho Debian 12: ${newEndpoint}. Sẵn sàng kết nối!`;

@@ -32,8 +32,15 @@ export class NetworkManager {
     throw new Error('No available port in forwarding pool.');
   }
 
+  public reservePort(port: number, vmId?: string): void {
+    if (Number.isInteger(port) && port > 0 && !this.allocatedPorts.has(port)) {
+      this.allocatedPorts.add(port);
+      serverLogger.info('NetworkManager', `Reserved existing local forwarding port ${port}`, vmId);
+    }
+  }
+
   public releasePort(port: number, vmId?: string): void {
-    if (this.allocatedPorts.has(port)) {
+    if (port !== 3389 && this.allocatedPorts.has(port)) {
       this.allocatedPorts.delete(port);
       serverLogger.info('NetworkManager', `Released local forwarding port ${port}`, vmId);
     }

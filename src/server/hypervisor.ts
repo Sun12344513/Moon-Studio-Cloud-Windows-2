@@ -22,6 +22,7 @@ export interface VmProcessInfo {
 
 export class HypervisorController {
   private vms: Map<string, VmProcessInfo> = new Map();
+  private nativePortBridges: Map<string, { port: number; server: net.Server }> = new Map();
   private disksDir: string;
 
   constructor() {
@@ -96,9 +97,12 @@ export class HypervisorController {
     const cores = options.cores || 2;
     const isoPath = options.isoPath;
 
-    // If already running, return current
+    // If already running, ensure native port bridge is active when applicable and return current
     const current = this.vms.get(vmId);
     if (current && current.pid && this.isPidRunning(current.pid)) {
+      if (osId === 'debian-12' && current.pid === process.pid && hostPort !== 3389) {
+        await this.ensureNativePortBridge(vmId, hostPort, 3389);
+      }
       serverLogger.warn('Hypervisor', `VM ${vmId} (${osId}) is already running with PID ${current.pid}`, vmId);
       return current;
     }
@@ -240,16 +244,41 @@ export class HypervisorController {
       }
     }
 
-    if (!hasQemuBin) {
+    // Synthetic 4MB CD001 stub ISOs contain no OS or XRDP server; Debian 12 uses Native Host + XRDP bridge
+    // unless a real installed disk (>= 50MB) or full bootable OS ISO (>= 50MB) is attached.
+    let hasBootableDebianMedia = false;
+    if (osId === 'debian-12') {
+      try {
+        const diskSize = fs.existsSync(diskPath) ? fs.statSync(diskPath).size : 0;
+        const isoSize = isoPath && fs.existsSync(isoPath) ? fs.statSync(isoPath).size : 0;
+        hasBootableDebianMedia = diskSize >= 50 * 1024 * 1024 || isoSize >= 50 * 1024 * 1024;
+      } catch {
+        hasBootableDebianMedia = false;
+      }
+    }
+
+    if (!hasQemuBin || (osId === 'debian-12' && !hasBootableDebianMedia)) {
       if (osId === 'windows-7') {
         serverLogger.warn('Hypervisor', `QEMU binary is not available to run Windows 7 SP1 in this sandbox.`, vmId);
         throw new Error('Môi trường Cloud Run sandbox không có QEMU để ảo hóa Windows 7. Vui lòng sử dụng máy chủ Debian 12 (Linux) thật.');
       }
 
+      // Clean up any stale QEMU process that may still hold hostPort
+      try {
+        execSync(`pkill -9 -f "hostfwd=tcp::${hostPort}-" || true`, { stdio: 'ignore' });
+      } catch {
+        // ignore
+      }
+
       // Native Container Host Cloud VPS for Debian 12
+      // For allocated secondary ports (e.g. 3390+), bridge local hostPort -> XRDP 127.0.0.1:3389
+      if (hostPort !== 3389) {
+        await this.ensureNativePortBridge(vmId, hostPort, 3389);
+      }
+
       serverLogger.info(
         'Hypervisor',
-        `Running Debian 12 native cloud instance (PID: ${process.pid}) on host platform`,
+        `Running Debian 12 native cloud instance (PID: ${process.pid}, localPort: ${hostPort} -> xrdp:3389) on host platform`,
         vmId
       );
       const nativeInfo: VmProcessInfo = {
@@ -265,7 +294,9 @@ export class HypervisorController {
         hardwareProfile: {
           chipset: 'Google Cloud Host / gVisor Container',
           virtualization: 'Native Host Container (4 vCPU, 12GB RAM)',
-          networkInterface: 'Direct Cloud Network (IPv4 Egress)',
+          networkInterface: hostPort !== 3389
+            ? `Direct Cloud Network (TCP Bridge 127.0.0.1:${hostPort} -> 3389)`
+            : 'Direct Cloud Network (IPv4 Egress)',
         },
       };
       this.vms.set(vmId, nativeInfo);
@@ -346,14 +377,84 @@ export class HypervisorController {
     return info;
   }
 
+  public async ensureNativePortBridge(vmId: string, listenPort: number, targetPort = 3389): Promise<void> {
+    if (listenPort === targetPort) return;
+
+    const existing = this.nativePortBridges.get(vmId);
+    if (existing && existing.port === listenPort && existing.server.listening) {
+      return;
+    }
+    if (existing) {
+      this.closeNativePortBridge(vmId);
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const server = net.createServer((clientSocket) => {
+        const targetSocket = net.connect(targetPort, '127.0.0.1');
+
+        const cleanup = () => {
+          if (!clientSocket.destroyed) clientSocket.destroy();
+          if (!targetSocket.destroyed) targetSocket.destroy();
+        };
+
+        clientSocket.on('error', cleanup);
+        targetSocket.on('error', cleanup);
+        clientSocket.on('close', cleanup);
+        targetSocket.on('close', cleanup);
+
+        clientSocket.pipe(targetSocket);
+        targetSocket.pipe(clientSocket);
+      });
+
+      server.once('error', (err) => {
+        serverLogger.error(
+          'Hypervisor',
+          `Native RDP bridge failed on 127.0.0.1:${listenPort} -> 127.0.0.1:${targetPort}: ${err.message}`,
+          vmId
+        );
+        reject(err);
+      });
+
+      server.listen(listenPort, '127.0.0.1', () => {
+        this.nativePortBridges.set(vmId, { port: listenPort, server });
+        serverLogger.info(
+          'Hypervisor',
+          `Native RDP TCP bridge active: 127.0.0.1:${listenPort} -> 127.0.0.1:${targetPort}`,
+          vmId
+        );
+        resolve();
+      });
+    });
+  }
+
+  public closeNativePortBridge(vmId: string): void {
+    const existing = this.nativePortBridges.get(vmId);
+    if (!existing) return;
+    try {
+      existing.server.close();
+    } catch {
+      // ignore
+    }
+    this.nativePortBridges.delete(vmId);
+    serverLogger.info('Hypervisor', `Closed native RDP TCP bridge on port ${existing.port}`, vmId);
+  }
+
   /**
    * Graceful ACPI shutdown via QMP
    */
   public async gracefulShutdown(vmId: string): Promise<boolean> {
     const info = this.vms.get(vmId);
     if (!info || !info.pid || !this.isPidRunning(info.pid)) {
+      this.closeNativePortBridge(vmId);
       serverLogger.warn('Hypervisor', `Cannot shutdown: VM ${vmId} is not running.`, vmId);
       return false;
+    }
+
+    if (info.pid === process.pid) {
+      this.closeNativePortBridge(vmId);
+      info.status = 'STOPPED';
+      info.pid = null;
+      return true;
     }
 
     serverLogger.info('Hypervisor', `Sending ACPI system_powerdown request to QEMU via QMP...`, vmId);
@@ -376,9 +477,16 @@ export class HypervisorController {
   }
 
   public async forceStop(vmId: string): Promise<boolean> {
+    this.closeNativePortBridge(vmId);
     const info = this.vms.get(vmId);
     if (!info || !info.pid) {
       return false;
+    }
+
+    if (info.pid === process.pid) {
+      info.status = 'STOPPED';
+      info.pid = null;
+      return true;
     }
 
     serverLogger.warn('Hypervisor', `Force stopping QEMU process (SIGKILL) for VM ${vmId} (PID: ${info.pid})`, vmId);

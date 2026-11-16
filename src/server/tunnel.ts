@@ -171,7 +171,7 @@ export class TunnelInstance {
         this.publicHost = '159.223.110.159';
         this.publicDomain = 'bore.pub';
         this.status = 'CONNECTED';
-        this.isVerified = true;
+        this.isVerified = false;
         serverLogger.info(
           'TunnelInstance',
           `Public TCP endpoint allocated for local port ${this.localPort}: ${this.publicHost}:${this.publicPort} (domain: ${this.publicDomain}:${this.publicPort})`
@@ -186,45 +186,67 @@ export class TunnelInstance {
         }
         this.portAssignedCallbacks = [];
 
-        // Verify endpoint
+        // Verify endpoint asynchronously
         this.verifyExternalEndpoint().catch(() => {});
       }
     }
   }
 
   public async verifyExternalEndpoint(): Promise<boolean> {
-    if (!this.publicPort) return false;
+    if (!this.publicPort || !this.publicHost) return false;
 
-    // 1. Basic socket test
-    const socketOk = await this.testSocket(this.publicHost, this.publicPort, 4000);
-    if (!socketOk) {
+    // 1. Verify local target port accepts X.224 RDP handshake BEFORE trusting remote relay
+    const localCheck = await rdpHealthChecker.checkRdp('127.0.0.1', this.localPort, 2000);
+    if (!localCheck.connected || !localCheck.rdpNegotiated) {
+      this.isVerified = false;
+      this.status = 'CONNECTED';
+      this.rdpVerification = {
+        connected: false,
+        latencyMs: localCheck.latencyMs,
+        rdpNegotiated: false,
+        statusMessage: `Local target 127.0.0.1:${this.localPort} is not responding with X.224 RDP yet.`,
+        error: localCheck.error,
+      };
       return false;
     }
 
-    this.isVerified = true;
-    this.status = 'VERIFIED';
-
-    // 2. Check if local port is an active RDP listener before probing public endpoint
-    const localCheck = await rdpHealthChecker.checkRdp('127.0.0.1', this.localPort, 1200);
-    if (localCheck.connected && localCheck.rdpNegotiated) {
-      // Local service is verified RDP, now verify remote tunnel
-      try {
-        const result = await rdpHealthChecker.checkRdp(this.publicHost, this.publicPort, 3500);
-        this.rdpVerification = result;
-      } catch {
-        // ignore
-      }
-    } else {
-      // Guest OS may still be booting up or in setup/BIOS; mark socket as verified
+    // 2. Verify public relay socket & end-to-end X.224 RDP handshake through bore tunnel
+    const socketOk = await this.testSocket(this.publicHost, this.publicPort, 4000);
+    if (!socketOk) {
+      this.isVerified = false;
+      this.status = 'CONNECTED';
       this.rdpVerification = {
-        connected: socketOk,
+        connected: false,
         latencyMs: 0,
         rdpNegotiated: false,
-        statusMessage: 'Cổng relay công khai đã sẵn sàng; đang đợi hệ điều hành máy ảo nạp dịch vụ Desktop.',
+        statusMessage: `Public endpoint ${this.publicHost}:${this.publicPort} did not accept TCP connection.`,
+        error: 'PUBLIC_SOCKET_UNREACHABLE',
+      };
+      return false;
+    }
+
+    try {
+      const result = await rdpHealthChecker.checkRdp(this.publicHost, this.publicPort, 4500);
+      this.rdpVerification = result;
+      if (result.connected && result.rdpNegotiated) {
+        this.isVerified = true;
+        this.status = 'VERIFIED';
+        return true;
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.rdpVerification = {
+        connected: false,
+        latencyMs: 0,
+        rdpNegotiated: false,
+        statusMessage: `Public RDP handshake failed: ${msg}`,
+        error: msg,
       };
     }
 
-    return true;
+    this.isVerified = false;
+    this.status = 'CONNECTED';
+    return false;
   }
 
   private testSocket(host: string, port: number, timeoutMs = 3000): Promise<boolean> {
@@ -314,7 +336,7 @@ export class TunnelManager {
     }
 
     await instance.start();
-    await instance.waitForPort(4000);
+    await instance.waitForPort(8000);
     return instance.getStatus();
   }
 
